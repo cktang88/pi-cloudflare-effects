@@ -42,7 +42,9 @@ The response contains `agentId` and `operationId`. Poll `GET /agents/:id` for du
 
 Worker logs include JSON status changes, tool outcomes, errors, and durations. A small Effect v4 tracer writes each span's name, trace and span IDs, outcome, and duration to Worker logs. `wrangler.jsonc` also enables Cloudflare invocation logs and traces. Cloudflare Traces follows a request across Cloudflare's platform, and the Observability release adds unified logs, traces, querying, dashboards, and telemetry export. [Cloudflare Traces](https://blog.cloudflare.com/cloudflare-tracing/) · [Cloudflare Observability](https://blog.cloudflare.com/one-observability-platform/)
 
-Useful optional MCP connections include Cloudflare AI Search for a managed knowledge base and Cloudflare Observability for log/trace queries. Add either endpoint through `MCP_SERVERS_JSON`; this app does not need an additional client library for those services. Confirm each endpoint's current URL and authentication in its Cloudflare dashboard before adding it.
+For a managed knowledge base, add an AI Search instance's built-in MCP endpoint through `MCP_SERVERS_JSON`; the agent then gets retrieval over that indexed content without another package. AI Search reached general availability on October 1 and includes built-in MCP support. [AI Search overview](https://developers.cloudflare.com/ai-search/)
+
+Cloudflare's October 2 Observability release adds unified logs, traces, querying, and dashboards. This Worker already writes Effect span events and tool outcomes to Worker logs. [Observability release](https://blog.cloudflare.com/one-observability-platform/)
 
 Pi 1.0's Codemode and MCP ideas are represented by Cloudflare Code Mode and the Agents MCP manager, registered as tools in Pi Durable. Pi's standalone Codemode package uses Node worker threads and cannot run in this Worker environment. The `generate_image` tool uses the Agents Workers AI image adapter; pass a Workers AI image model ID and prompt. [Pi 1.0 release notes](https://pi.dev/changelog/releases/1.0.0)
 
