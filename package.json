@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "engines": {
-    "node": "^22.18.0 || >=24.11.0"
+    "node": "^22.19.0 || >=24.11.0"
   },
   "scripts": {
     "dev": "wrangler dev",
@@ -13,9 +13,11 @@
   "dependencies": {
     "@cloudflare/codemode": "0.5.3",
     "@cloudflare/computer": "0.3.1",
-    "@earendil-works/pi-ai": "0.99.2",
-    "@earendil-works/pi-durable": "0.99.2",
+    "@earendil-works/chord": "1.0.0",
+    "@earendil-works/pi-ai": "1.0.0",
+    "@earendil-works/pi-durable": "1.0.0",
     "@modelcontextprotocol/client": "2.0.0",
+    "@modelcontextprotocol/sdk": "1.30.0",
     "agents": "0.25.0",
     "ai": "7.0.122",
     "effect": "4.0.0",

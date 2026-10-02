@@ -1,6 +1,7 @@
 import { Agent as DurableAgent } from "agents";
 import { Effect } from "effect";
 import { PiAgent } from "./worker-agent";
+import { withObservability } from "./observability";
 import type { AgentStatus, Env, LaunchResult, RunResult } from "./types";
 
 export class Orchestrator extends DurableAgent<Env> {
@@ -13,7 +14,7 @@ export class Orchestrator extends DurableAgent<Env> {
 				return { agentId, operationId: result.operationId };
 			},
 			catch: (cause) => new Error("Could not launch Pi agent", { cause }),
-		}).pipe(Effect.withSpan("orchestrator.launch", { attributes: { agentId } }));
+		}).pipe(Effect.withSpan("orchestrator.launch", { attributes: { agentId } }), withObservability);
 		return Effect.runPromise(program);
 	}
 
