@@ -9,8 +9,8 @@ import { createModels } from "@earendil-works/pi-ai/models";
 import { Type } from "@earendil-works/pi-ai";
 import { configure, createRegistry, defineExtension, defineTool, Harness, section, type Conversation, type EntryRecord, type ToolRegistration } from "@earendil-works/pi-durable";
 import { JsonlStorage } from "@earendil-works/pi-durable/storage/jsonl";
-import { Agent as DurableAgent } from "agents";
-import { Lifecycle, LifecycleCapability, type LifecycleJobContext, type LifecycleJobOutcome } from "agents/lifecycle";
+import { Agent as DurableAgent, type AgentContext } from "agents";
+import { LifecycleCapability, type LifecycleJobContext, type LifecycleJobOutcome } from "agents/lifecycle";
 import { createBrowserTools } from "agents/browser/ai";
 import { CLOUDFLARE_PROVIDER_ID, createAI } from "agents/models/pi-ai";
 import { tool } from "ai";
@@ -53,7 +53,11 @@ export class PiAgent extends DurableAgent<Env> {
 		],
 	});
 	readonly piLifecycle = new PiDurableLifecycle(this);
-	readonly lifecycle = Lifecycle.install(this).use(this.mcp).use(this.piLifecycle);
+
+	constructor(ctx: AgentContext, env: Env) {
+		super(ctx, env);
+		this.lifecycle.use(this.piLifecycle);
+	}
 
 	async onStart(): Promise<void> {
 		if (!(await this.ctx.storage.get<AgentStatus>("agent:status"))) {
@@ -273,7 +277,7 @@ export class PiAgent extends DurableAgent<Env> {
 
 	async getStatus(): Promise<AgentStatus> {
 		const status = (await this.ctx.storage.get<AgentStatus>("agent:status")) ?? {
-			agentId: this.ctx.id.toString(), status: "idle", updatedAt: new Date(0).toISOString(),
+			agentId: this.name, status: "idle", updatedAt: new Date(0).toISOString(),
 		};
 		if (status.status !== "running" || !status.operationId) return status;
 		await this.piLifecycle.wake();
@@ -292,7 +296,7 @@ export class PiAgent extends DurableAgent<Env> {
 	private async saveStatus(update: Partial<AgentStatus> & Pick<AgentStatus, "status">): Promise<void> {
 		const previous = await this.ctx.storage.get<AgentStatus>("agent:status");
 		const status: AgentStatus = {
-			agentId: this.ctx.id.toString(), status: update.status,
+			agentId: this.name, status: update.status,
 			updatedAt: new Date().toISOString(),
 			...(update.lastError ? { lastError: update.lastError } : {}),
 			...(update.lastResponse ? { lastResponse: update.lastResponse } : {}),

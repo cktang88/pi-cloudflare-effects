@@ -3,6 +3,7 @@ import { Orchestrator } from "./orchestrator";
 import { PiAgent } from "./worker-agent";
 
 export { Orchestrator, PiAgent };
+export { CodemodeRuntime } from "@cloudflare/codemode";
 
 export default {
 	async fetch(request: Request, env: Env): Promise<Response> {

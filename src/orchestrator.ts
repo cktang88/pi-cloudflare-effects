@@ -1,15 +1,17 @@
-import { Agent as DurableAgent } from "agents";
+import { Agent as DurableAgent, getAgentByName } from "agents";
 import { Effect } from "effect";
-import { PiAgent } from "./worker-agent";
 import { withObservability } from "./observability";
 import type { AgentStatus, Env, LaunchResult, RunResult } from "./types";
+
+const AGENT_PREFIX = "pi-agent:";
 
 export class Orchestrator extends DurableAgent<Env> {
 	async launch(prompt: string): Promise<LaunchResult> {
 		const agentId = crypto.randomUUID();
 		const program = Effect.tryPromise({
 			try: async () => {
-				const agent = await this.subAgent(PiAgent, agentId);
+				await this.ctx.storage.put(`${AGENT_PREFIX}${agentId}`, { createdAt: Date.now() });
+				const agent = await getAgentByName(this.env.PI_AGENT, agentId);
 				const result = await agent.launch(prompt);
 				return { agentId, operationId: result.operationId };
 			},
@@ -26,18 +28,17 @@ export class Orchestrator extends DurableAgent<Env> {
 	}
 
 	async getAgentStatus(agentId: string): Promise<AgentStatus | null> {
-		const agent = await this.findAgent(agentId, false);
+		const agent = await this.findAgent(agentId);
 		return agent ? agent.getStatus() : null;
 	}
 
 	async listAgents(): Promise<Array<{ name: string; createdAt: number }>> {
-		return this.listSubAgents()
-			.filter((agent) => agent.className === "PiAgent")
-			.map(({ name, createdAt }) => ({ name, createdAt }));
+		const records = await this.ctx.storage.list<{ createdAt: number }>({ prefix: AGENT_PREFIX });
+		return [...records].map(([key, record]) => ({ name: key.slice(AGENT_PREFIX.length), createdAt: record.createdAt }));
 	}
 
-	private async findAgent(agentId: string, create = true) {
-		if (!create && !(await this.hasSubAgent(PiAgent, agentId))) return null;
-		return await this.subAgent(PiAgent, agentId);
+	private async findAgent(agentId: string) {
+		if (!(await this.ctx.storage.get(`${AGENT_PREFIX}${agentId}`))) return null;
+		return await getAgentByName(this.env.PI_AGENT, agentId);
 	}
 }

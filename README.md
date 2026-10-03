@@ -7,14 +7,14 @@ A Cloudflare Worker that launches Pi Durable agents. Each agent runs the Pi Dura
 ```text
 POST /agents
     └─ Orchestrator Durable Object
-         └─ one agent Durable Object per run
+         └─ one named agent Durable Object per run
               ├─ Pi Durable conversation, tasks, submissions, and subagents
               ├─ Computer workspace + Artifacts Git
               ├─ Code Mode → Computer, Browser, Web Search, MCP
               └─ on-demand Linux Container + filesystem snapshots
 ```
 
-Pi Durable is the agent runtime. The old Pi coding-agent runtime is not installed here. Pi Durable 1.0 does not share the 0.99 peer range still declared by `agents@0.25.0` for its experimental Pi harness, so the app opens Pi Durable directly over a durable file store and uses the Agents lifecycle queue to wake it. The repo-local `.npmrc` permits fresh package releases and skips that stale peer check; it does not affect global npm settings.
+Pi Durable is the agent runtime. The old Pi coding-agent runtime is not installed here. Pi Durable 1.0 does not share the 0.99 peer range still declared by `agents@0.25.0` for its experimental Pi harness, so the app opens Pi Durable directly over a durable file store and attaches its wake queue to the Agent's lifecycle. Each independent agent gets a named `PiAgent` Durable Object through the `PI_AGENT` namespace; the Orchestrator stores the names so it can list and reconnect to them. Pi Durable delegation creates child conversations inside that object. The repo-local `.npmrc` permits fresh package releases and skips that stale peer check; it does not affect global npm settings.
 
 ## Set up
 
