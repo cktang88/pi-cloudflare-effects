@@ -35,6 +35,7 @@ type PiRuntime = { harness: Harness; root: Conversation };
 
 export class PiAgent extends DurableAgent<Env> {
 	private mcpServersAdded = false;
+	private runtime: Promise<PiRuntime> | undefined;
 	readonly ai = createAI({ binding: this.env.AI });
 	readonly registry = createRegistry();
 	readonly workspace = new Workspace({
@@ -74,18 +75,14 @@ export class PiAgent extends DurableAgent<Env> {
 				await this.saveStatus({ status: "running" });
 				const operationId = crypto.randomUUID();
 				const runtime = await this.openRuntime();
-				try {
-					const submission = await runtime.root.submit({ type: "input", content: prompt, requestId: operationId }, BACKGROUND_CONTEXT);
-					await this.saveStatus({ status: "running", operationId });
-					const settled = await submission.wait(BACKGROUND_CONTEXT);
-					if (settled.status !== "done") throw new Error(settled.reason ?? "Pi Durable conversation did not complete");
-					const text = settled.type === "input" ? await readAssistantText(runtime.root, settled.answer) : "";
-					await this.saveSandbox();
-					await this.saveStatus({ status: "complete", lastResponse: text });
-					return { text };
-				} finally {
-					await runtime.harness.close(BACKGROUND_CONTEXT);
-				}
+				const submission = await runtime.root.submit({ type: "input", content: prompt, requestId: operationId }, BACKGROUND_CONTEXT);
+				await this.saveStatus({ status: "running", operationId });
+				const settled = await submission.wait(BACKGROUND_CONTEXT);
+				if (settled.status !== "done") throw new Error(settled.reason ?? "Pi Durable conversation did not complete");
+				const text = settled.type === "input" ? await readAssistantText(runtime.root, settled.answer) : "";
+				await this.saveSandbox();
+				await this.saveStatus({ status: "complete", lastResponse: text });
+				return { text };
 			},
 			catch: (cause) => new Error("Pi Durable run failed", { cause }),
 		}).pipe(
@@ -109,36 +106,32 @@ export class PiAgent extends DurableAgent<Env> {
 		const operationId = crypto.randomUUID();
 		await this.piLifecycle.wake();
 		const runtime = await this.openRuntime();
-		try {
-			await runtime.root.submit({ type: "input", content: prompt, requestId: operationId }, BACKGROUND_CONTEXT);
-			await this.saveStatus({ status: "running", operationId });
-		} finally {
-			await runtime.harness.close(BACKGROUND_CONTEXT);
-		}
+		await runtime.root.submit({ type: "input", content: prompt, requestId: operationId }, BACKGROUND_CONTEXT);
+		await this.saveStatus({ status: "running", operationId });
 		await this.piLifecycle.wake();
 		return { operationId };
 	}
 
 	async resumePiWork(): Promise<boolean> {
 		const runtime = await this.openRuntime();
-		try {
-			const inspection = await runtime.harness.inspect(BACKGROUND_CONTEXT);
-			return inspection.tasks.length > 0 || inspection.submissions.length > 0;
-		} finally {
-			await runtime.harness.close(BACKGROUND_CONTEXT);
-		}
+		const inspection = await runtime.harness.inspect(BACKGROUND_CONTEXT);
+		return inspection.tasks.length > 0 || inspection.submissions.length > 0;
 	}
 
 	async waitForPiIdle(signal: AbortSignal): Promise<void> {
 		const runtime = await this.openRuntime();
-		try {
-			await runtime.root.waitForIdle(withAbortSignal(signal, BACKGROUND_CONTEXT));
-		} finally {
-			await runtime.harness.close(BACKGROUND_CONTEXT);
-		}
+		await runtime.root.waitForIdle(withAbortSignal(signal, BACKGROUND_CONTEXT));
 	}
 
-	private async openRuntime(): Promise<PiRuntime> {
+	private openRuntime(): Promise<PiRuntime> {
+		this.runtime ??= this.createRuntime().catch((error: unknown) => {
+			this.runtime = undefined;
+			throw error;
+		});
+		return this.runtime;
+	}
+
+	private async createRuntime(): Promise<PiRuntime> {
 		await this.connectMcpServers();
 		await this.mcp.waitForConnections({ timeout: 10_000 });
 		const models = createModels();
@@ -199,13 +192,13 @@ export class PiAgent extends DurableAgent<Env> {
 				execute: async ({ task }, api, context) => {
 					const childId = await api.commit(async (tx) => {
 						const existing = (await tx.scanConversations({ ownerTaskId: api.taskId }, 1)).items[0];
-					if (existing) return existing.id;
+						if (existing) return existing.id;
 						const created = await tx.createConversation({
 							ownership: { kind: "task", taskId: api.taskId },
 						});
 						await configure(tx, created.id, { extensions: [coreExtension] });
 						return created.id;
-				}, context);
+					}, context);
 					await api.details({ conversationId: childId }, context);
 					const child = await api.conversation(childId, context);
 					if (!child) throw new Error("Pi Durable child conversation was not created");
@@ -285,17 +278,13 @@ export class PiAgent extends DurableAgent<Env> {
 		if (status.status !== "running" || !status.operationId) return status;
 		await this.piLifecycle.wake();
 		const runtime = await this.openRuntime();
-		try {
-			const submission = await runtime.root.commit((tx) => tx.submissionByRequest(runtime.root.id, status.operationId!), BACKGROUND_CONTEXT);
-			if (!submission || submission.status === "queued" || submission.status === "placed") return status;
-			if (submission.status === "done") {
-				const text = submission.type === "input" ? await readAssistantText(runtime.root, submission.answer) : "";
-				await this.saveStatus({ status: "complete", operationId: status.operationId, lastResponse: text });
-			} else {
-				await this.saveStatus({ status: "failed", operationId: status.operationId, lastError: submission.reason });
-			}
-		} finally {
-			await runtime.harness.close(BACKGROUND_CONTEXT);
+		const submission = await runtime.root.commit((tx) => tx.submissionByRequest(runtime.root.id, status.operationId!), BACKGROUND_CONTEXT);
+		if (!submission || submission.status === "queued" || submission.status === "placed") return status;
+		if (submission.status === "done") {
+			const text = submission.type === "input" ? await readAssistantText(runtime.root, submission.answer) : "";
+			await this.saveStatus({ status: "complete", operationId: status.operationId, lastResponse: text });
+		} else {
+			await this.saveStatus({ status: "failed", operationId: status.operationId, lastError: submission.reason });
 		}
 		return (await this.ctx.storage.get<AgentStatus>("agent:status")) ?? status;
 	}
