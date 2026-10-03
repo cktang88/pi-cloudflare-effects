@@ -16,7 +16,7 @@ import { CLOUDFLARE_PROVIDER_ID, createAI } from "agents/models/pi-ai";
 import { tool } from "ai";
 import { Effect } from "effect";
 import { z } from "zod";
-import { withObservability } from "./observability";
+import { withCloudflareSpan, withObservability } from "./observability";
 import { DurableObjectFiles } from "./durable-files";
 import type { AgentStatus, Env } from "./types";
 
@@ -94,7 +94,7 @@ export class PiAgent extends DurableAgent<Env> {
 			withObservability,
 		);
 		try {
-			return await Effect.runPromise(program);
+			return await withCloudflareSpan("agent.run", { "agent.id": this.name }, () => Effect.runPromise(program));
 		} catch (error) {
 			try {
 				await this.saveSandbox();
@@ -107,13 +107,15 @@ export class PiAgent extends DurableAgent<Env> {
 	}
 
 	async launch(prompt: string): Promise<{ operationId: string }> {
-		const operationId = crypto.randomUUID();
-		await this.piLifecycle.wake();
-		const runtime = await this.openRuntime();
-		await runtime.root.submit({ type: "input", content: prompt, requestId: operationId }, BACKGROUND_CONTEXT);
-		await this.saveStatus({ status: "running", operationId });
-		await this.piLifecycle.wake();
-		return { operationId };
+		return withCloudflareSpan("agent.launch", { "agent.id": this.name }, async () => {
+			const operationId = crypto.randomUUID();
+			await this.piLifecycle.wake();
+			const runtime = await this.openRuntime();
+			await runtime.root.submit({ type: "input", content: prompt, requestId: operationId }, BACKGROUND_CONTEXT);
+			await this.saveStatus({ status: "running", operationId });
+			await this.piLifecycle.wake();
+			return { operationId };
+		});
 	}
 
 	async resumePiWork(): Promise<boolean> {
@@ -395,15 +397,18 @@ function toPiTools(toolSet: Record<string, unknown>): ToolRegistration[] {
 }
 
 function traceTool<T>(name: string, run: () => Promise<T>): Promise<T> {
-	const startedAt = Date.now();
-	return Effect.runPromise(Effect.tryPromise({
-		try: run,
-		catch: (cause) => new Error(`Tool ${name} failed`, { cause }),
-	}).pipe(Effect.withSpan(`agent.tool.${name}`), withObservability)).then((result) => {
-		console.log(JSON.stringify({ event: "agent.tool", name, outcome: "ok", durationMs: Date.now() - startedAt }));
-		return result;
-	}, (error: unknown) => {
-		console.error(JSON.stringify({ event: "agent.tool", name, outcome: "error", durationMs: Date.now() - startedAt, error: error instanceof Error ? error.message : String(error) }));
-		throw error;
+	return withCloudflareSpan(`agent.tool.${name}`, { "agent.tool.name": name }, async () => {
+		const startedAt = Date.now();
+		try {
+			const result = await Effect.runPromise(Effect.tryPromise({
+				try: run,
+				catch: (cause) => new Error(`Tool ${name} failed`, { cause }),
+			}).pipe(Effect.withSpan(`agent.tool.${name}`), withObservability));
+			console.log(JSON.stringify({ event: "agent.tool", name, outcome: "ok", durationMs: Date.now() - startedAt }));
+			return result;
+		} catch (error) {
+			console.error(JSON.stringify({ event: "agent.tool", name, outcome: "error", durationMs: Date.now() - startedAt, error: error instanceof Error ? error.message : String(error) }));
+			throw error;
+		}
 	});
 }

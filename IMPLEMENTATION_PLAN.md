@@ -20,9 +20,9 @@
 - [x] Expose Computer, Browser, Web Search, MCP, and Artifacts through Cloudflare Code Mode.
 - [x] Add durable workspace memory guidance and Workers AI image generation.
 - [x] Restore Container snapshots on demand and save a new snapshot after each shell command.
-- [x] Enable Cloudflare invocation logs and traces; log structured status and timed tool outcomes around Effect spans.
+- [x] Enable Cloudflare invocation logs and native custom spans; keep structured Effect span, status, and tool outcome logs.
 - [x] Document current setup, local dependency age override, optional MCP service suggestions, and platform limits.
 - [x] Verify `npm ci` and TypeScript using Node.js 24.19.
 - [x] Run Wrangler dry-run using Node.js 24.19 after resolving the missing MCP SDK peer and incompatible PiHarness bridge.
-- [x] Smoke-check local agent listing, input validation, named Durable Object launch, status polling, structured Effect span logs, and registry/status persistence across a Wrangler restart. The local AI binding is unavailable, so model completion was not verified; local Container startup also needs Docker.
+- [x] Smoke-check local agent listing, input validation, named Durable Object launch, status polling, native Cloudflare launch/list spans, Effect span logs, and registry/status persistence across a Wrangler restart. The local AI binding is unavailable, so model completion was not verified; local Container startup also needs Docker.
 - [ ] Create the requested GitHub repository and push after GitHub authentication is restored.

@@ -1,4 +1,5 @@
 import { Effect, Exit, Tracer } from "effect";
+import { tracing } from "cloudflare:workers";
 
 const tracer = Tracer.make({
 	span(options) {
@@ -35,3 +36,20 @@ const tracer = Tracer.make({
 
 export const withObservability = <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
 	effect.pipe(Effect.withTracer(tracer));
+
+export const withCloudflareSpan = <A>(
+	name: string,
+	attributes: Record<string, string | number | boolean | undefined>,
+	run: () => Promise<A>,
+): Promise<A> => tracing.enterSpan(name, async (span) => {
+	span.setAttributes(attributes);
+	try {
+		const result = await run();
+		span.setAttribute("agent.outcome", "ok");
+		return result;
+	} catch (error) {
+		span.setAttribute("agent.outcome", "error");
+		span.recordException(error instanceof Error ? error : String(error));
+		throw error;
+	}
+});
