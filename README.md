@@ -56,6 +56,8 @@ Effect v4 spans and Cloudflare custom spans cover orchestration, agent runs, and
 
 Use Node.js 22.19+ or 24.11+.
 
+The `config.dev` setting in `package.json` selects the runtime. With `true`, `npm run dev` runs the Worker locally and keeps bindings with no local simulator (Workers AI and Artifacts) remote. Browser, Durable Objects, Worker Loader, and Containers use local Wrangler support. Set it to `false` to run the Worker and all bindings remotely on Cloudflare.
+
 ```sh
 npm ci
 npm run dev
@@ -63,7 +65,7 @@ npm run dev
 
 Open [http://localhost:8787](http://localhost:8787) for the Runtime Event Lab. It launches a real Pi Durable run for a small warehouse restock task. The local run needs the configured Workers AI binding to be available.
 
-Wrangler bindings are declared in `wrangler.jsonc`: Durable Objects, Workers AI, Browser, Worker Loader, Containers, and Artifacts. Workers AI and Browser use remote bindings during local development because they have no local simulator; Wrangler still runs the Worker code on your machine. This needs Cloudflare login and uses real Cloudflare services, which can incur charges. Create or select the Cloudflare resources required by those bindings before deploying. The Artifacts namespace is set to `default` in the config; change it if your namespace has another name.
+Wrangler bindings are declared in `wrangler.jsonc`. In local mode, Workers AI and Artifacts use Cloudflare because they have no local simulator; Browser, Durable Objects, Worker Loader, and Containers use local support. This local setup still needs Cloudflare login and a plan that supports remote Artifacts, and it uses real Workers AI, which can incur charges. Remote mode requires a plan that supports this project's Artifacts and Dynamic Workers features. Create or select the Cloudflare resources required by those bindings before deploying. The Artifacts namespace is set to `default` in the config; change it if your namespace has another name.
 
 Optional settings:
 

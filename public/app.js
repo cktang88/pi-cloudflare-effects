@@ -73,7 +73,7 @@ function setStatus(status) {
   if (status?.lastResponse && $("answer").textContent !== status.lastResponse) $("answer").textContent = status.lastResponse;
   else if (status?.lastError) {
     const explanation = status.lastError === "model_error"
-      ? "Workers AI could not run in this local Wrangler mode. The AI binding has no local simulator; start with remote bindings to run GLM 5.3 Flash."
+      ? "The model request failed (model_error). Check the run trace and Wrangler output for any underlying provider details."
       : `Run failed: ${status.lastError}`;
     if ($("answer").textContent !== explanation) $("answer").textContent = explanation;
   }
