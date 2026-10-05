@@ -67,7 +67,7 @@ Wrangler bindings are declared in `wrangler.jsonc`: Durable Objects, Workers AI,
 
 Optional settings:
 
-- `MODEL_ID`: Workers AI model ID. Defaults to `@cf/zai-org/glm-4.7-flash`.
+- `MODEL_ID`: Workers AI model ID. Defaults to `@cf/zai-org/glm-5.3-flash`.
 - `AI_GATEWAY_ID`: AI Gateway ID for Web Search. Defaults to `default`.
 - `MCP_SERVERS_JSON`: JSON array of MCP servers, each with a `name`, `url`, and optional `headers` object.
 

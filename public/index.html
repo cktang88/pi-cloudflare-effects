@@ -3,427 +3,135 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="dark">
-  <title>Pi Durable · Event Lab</title>
-  <style>
-    :root { font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #ecf3f2; background: #0c1113; font-synthesis: none; }
-    * { box-sizing: border-box; }
-    body { margin: 0; min-height: 100vh; background: radial-gradient(ellipse at 10% -10%, #163230 0, transparent 38%), #0c1113; }
-    button, textarea { font: inherit; }
-    .shell { max-width: 1220px; margin: auto; padding: 34px 24px 48px; }
-    header { display: flex; align-items: end; justify-content: space-between; gap: 24px; margin-bottom: 24px; }
-    .eyebrow { color: #6fd8bd; font-size: 12px; font-weight: 700; letter-spacing: .13em; text-transform: uppercase; }
-    h1 { margin: 8px 0 6px; font-size: clamp(28px, 5vw, 42px); letter-spacing: -.045em; }
-    .intro { margin: 0; color: #9aacab; max-width: 680px; line-height: 1.55; }
-    .local { border: 1px solid #263a39; border-radius: 999px; color: #9aacab; padding: 8px 12px; white-space: nowrap; font-size: 12px; }
-    .grid { display: grid; grid-template-columns: minmax(270px, .8fr) minmax(0, 1.5fr); gap: 16px; }
-    .panel { border: 1px solid #263334; border-radius: 14px; background: rgba(17, 24, 26, .94); padding: 20px; box-shadow: 0 14px 50px #0002; }
-    h2 { margin: 0 0 16px; font-size: 16px; }
-    label { display: block; margin-bottom: 8px; color: #a6b6b4; font-size: 12px; font-weight: 650; }
-    textarea { display: block; width: 100%; min-height: 138px; padding: 12px; resize: vertical; color: #e8f1ee; background: #0d1415; border: 1px solid #314140; border-radius: 9px; line-height: 1.5; }
-    .buttons { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
-    button { border: 1px solid #36504c; color: #d9e8e4; background: #182422; border-radius: 8px; padding: 9px 12px; cursor: pointer; transition: background .15s, border-color .15s; }
-    button:hover:enabled { background: #20332f; border-color: #69bba5; }
-    button:disabled { cursor: not-allowed; opacity: .4; }
-    button.primary { background: #6fd8bd; border-color: #6fd8bd; color: #10201c; font-weight: 750; }
-    button.primary:hover:enabled { background: #8be8d1; }
-    button.warn { border-color: #715c31; color: #e7ca8b; background: #282216; }
-    button.danger { border-color: #6f3e3e; color: #efaaaa; background: #2a1919; }
-    .hint { color: #80918f; font-size: 12px; line-height: 1.5; margin: 14px 0 0; }
-    .meta { display: grid; grid-template-columns: 1fr auto; gap: 12px; align-items: center; padding-bottom: 14px; border-bottom: 1px solid #263334; }
-    .status { display: inline-flex; align-items: center; gap: 7px; color: #aab9b6; font-size: 13px; }
-    .dot { width: 8px; height: 8px; border-radius: 99px; background: #71817e; }
-    .dot.running { background: #72d7ba; box-shadow: 0 0 12px #72d7ba88; }
-    .dot.failed { background: #e87f7f; }
-    .dot.complete { background: #7ecf8e; }
-    code { color: #92d9c5; font-size: 11px; overflow-wrap: anywhere; }
-    .socket { color: #839492; font-size: 11px; text-align: right; }
-    .event-head { display: flex; justify-content: space-between; align-items: center; margin: 16px 0 10px; }
-    .event-head h2 { margin: 0; }
-    .events { height: min(58vh, 510px); min-height: 300px; overflow: auto; display: flex; flex-direction: column; gap: 7px; }
-    .answer { margin-top: 14px; padding: 13px; border: 1px solid #263334; border-radius: 9px; background: #0d1415; }
-    .answer-title { color: #9aacab; font-size: 11px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
-    .answer pre { white-space: pre-wrap; overflow-wrap: anywhere; margin: 8px 0 0; color: #d9e6e2; font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
-    .empty { color: #81908e; font-size: 13px; line-height: 1.55; padding: 22px 12px; text-align: center; border: 1px dashed #344240; border-radius: 9px; }
-    .event { display: grid; grid-template-columns: 72px minmax(0, 1fr); gap: 10px; padding: 10px 11px; border: 1px solid #273535; background: #111819; border-radius: 8px; font-size: 12px; }
-    .time { color: #788a87; font-variant-numeric: tabular-nums; padding-top: 1px; }
-    .event-name { color: #d3e2de; font-weight: 680; overflow-wrap: anywhere; }
-    .event.warn .event-name { color: #e6ca88; }
-    .event.error .event-name { color: #f09a9a; }
-    .detail { display: block; color: #899895; font-weight: 400; margin-top: 4px; overflow-wrap: anywhere; line-height: 1.45; }
-    .tabs { display: flex; gap: 6px; margin: 14px 0 10px; border-bottom: 1px solid #263334; }
-    .tab { border: 0; border-radius: 7px 7px 0 0; background: transparent; color: #849592; padding: 8px 11px; }
-    .tab.active { border-bottom: 2px solid #6fd8bd; color: #dcebe7; }
-    .state-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-bottom: 12px; }
-    .state-card, .list-row { padding: 11px; border: 1px solid #263334; background: #111819; border-radius: 8px; min-width: 0; }
-    .state-label { color: #81928f; font-size: 10px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
-    .state-value { color: #dce8e4; font-size: 12px; margin-top: 5px; overflow-wrap: anywhere; }
-    .list { display: flex; flex-direction: column; gap: 7px; max-height: 52vh; overflow: auto; }
-    .list-row { font-size: 12px; color: #cad8d4; overflow-wrap: anywhere; }
-    .list-row strong { color: #e0ece8; font-size: 12px; }
-    .list-row pre { white-space: pre-wrap; overflow-wrap: anywhere; color: #a9bab6; font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; margin: 7px 0 0; max-height: 170px; overflow: auto; }
-    details.instructions { border: 1px solid #263334; border-radius: 8px; padding: 11px; margin-bottom: 12px; color: #aebeba; font-size: 12px; }
-    details.instructions summary { cursor: pointer; color: #dce8e4; font-weight: 650; }
-    details.instructions pre { white-space: pre-wrap; color: #a9bab6; font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; margin: 10px 0 0; }
-    .pill { display: inline-block; margin: 6px 5px 0 0; border: 1px solid #32423f; border-radius: 999px; padding: 3px 7px; color: #a3bbb3; font-size: 10px; }
-    [hidden] { display: none !important; }
-    .notes { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-top: 16px; }
-    .note { padding: 14px 15px; border: 1px solid #263334; border-radius: 10px; color: #98a9a6; font-size: 12px; line-height: 1.5; }
-    .note strong { display: block; margin-bottom: 5px; color: #dbe8e4; font-size: 12px; }
-    @media (max-width: 760px) { .shell { padding: 24px 14px; } header { align-items: start; flex-direction: column; gap: 12px; } .grid { grid-template-columns: 1fr; } .events { height: 360px; } .notes { grid-template-columns: 1fr; } }
-  </style>
+  <meta name="color-scheme" content="light">
+  <title>Pi Durable · Field Recorder</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script type="module" src="/app.js"></script>
 </head>
 <body>
   <main class="shell">
-    <header>
+    <header class="masthead">
       <div>
-        <div class="eyebrow">Pi Durable · Cloudflare Agents</div>
-        <h1>Runtime event lab</h1>
-        <p class="intro">Run a small warehouse restock task, then interrupt or disconnect the viewer and watch the Durable Object record what happened.</p>
+        <div class="eyebrow"><span class="brand-mark" aria-hidden="true">P·D</span> Pi Durable / Field Recorder</div>
+        <h1>See the run.<br>Understand the failure.</h1>
+        <p class="intro">A working instrument for watching an agent think, act, disconnect, and recover. The event rail stays in view while you inspect its brain and hands.</p>
       </div>
-      <span class="local">Local demo · not for public deployment</span>
+      <span class="local">Local instrument · private to this machine</span>
     </header>
 
-    <div class="grid">
-      <section class="panel" aria-labelledby="task-title">
-        <h2 id="task-title">1 · Give the agent a task</h2>
-        <label for="prompt">Demo task</label>
-        <textarea id="prompt">You are helping a small warehouse. A shipment arrived with 8 desk lamps and 3 keyboards. Current stock is 2 desk lamps and 5 keyboards. The target stock is 6 lamps and 4 keyboards. Use the workspace tools through code_mode to write /restock-plan.md with the quantities to reorder and a short explanation. Then report the file you created and the reorder quantities.</textarea>
-        <div class="buttons">
-          <button id="launch" class="primary">Launch durable run</button>
-          <button id="new-run">Start a fresh agent</button>
+    <section class="status-strip" aria-label="Selected run status">
+      <div class="status-readout">
+        <span class="section-kicker">Selected run</span>
+        <div id="status" class="status"><span class="dot"></span><span>Not started</span></div>
+        <div id="agent-id" class="agent-id"><code>No agent selected</code></div>
+      </div>
+      <div class="observer-readout">
+        <span class="section-kicker">Observer link</span>
+        <div id="socket" class="socket" role="status">Waiting for a run</div>
+        <span class="hint">Disconnecting the viewer leaves the durable run alone.</span>
+      </div>
+    </section>
+
+    <div class="console-grid">
+      <section class="instrument panel" aria-labelledby="recorder-title">
+        <div class="instrument-head">
+          <div>
+            <span class="section-kicker">01 / Observability</span>
+            <h2 id="recorder-title">Flight recorder</h2>
+            <p class="panel-intro">One chronological account of what the runtime accepted, did, and saved.</p>
+          </div>
+          <button id="clear-view" title="Clear only the events shown in this browser">Clear view</button>
         </div>
-        <p class="hint">The model runs through PiHarness. Launch returns after the work is durably accepted; the task can finish after this page disconnects.</p>
-        <h2 style="margin-top:24px">2 · Send a runtime event</h2>
-        <div class="buttons">
-          <button id="disconnect">Disconnect log socket</button>
-          <button id="reconnect">Reconnect and replay</button>
-          <button id="arm-timeout" class="warn">Arm 5s deadline</button>
-          <button id="timeout" class="warn">Fire deadline now</button>
-          <button id="oom" class="danger">Inject OOM-like failure</button>
+
+        <div class="instrument-split">
+          <section class="trace-column" aria-labelledby="trace-title">
+            <div class="event-head">
+              <div>
+                <span class="section-kicker">Durable event history</span>
+                <h3 id="trace-title">Run trace</h3>
+              </div>
+              <span class="trace-key"><i aria-hidden="true"></i> newest at bottom</span>
+            </div>
+            <div id="events" class="events event-rail" aria-live="polite" aria-relevant="additions">
+              <div class="empty"><strong>Awaiting a run</strong><span>Launch the sample task to watch submissions, tool calls, status changes, and reconnect replay arrive in order.</span></div>
+            </div>
+            <div class="answer">
+              <div class="answer-top">
+                <span class="answer-title">Run result</span>
+                <span class="model-indicator">Model <strong id="model-name">GLM 5.3 Flash · Workers AI</strong></span>
+              </div>
+              <pre id="answer">The final response will be kept with this run.</pre>
+            </div>
+          </section>
+
+          <section class="inspection-column" aria-label="Live Pi Durable inspection">
+            <div class="inspect-heading">
+              <span class="section-kicker">02 / Inside the run</span>
+              <p>Live snapshots refresh while the observer link is connected.</p>
+            </div>
+            <div class="tabs" role="tablist" aria-label="Runtime inspection">
+              <button id="tab-brain" class="tab active" data-tab="brain" role="tab" aria-selected="true" aria-controls="view-brain" tabindex="0">Brain</button>
+              <button id="tab-hands" class="tab" data-tab="hands" role="tab" aria-selected="false" aria-controls="view-hands" tabindex="-1">Hands</button>
+            </div>
+            <section id="view-brain" role="tabpanel" aria-labelledby="tab-brain" tabindex="0">
+              <div id="brain-summary" class="state-grid"><div class="empty">Start a run to read its model, sessions, pending work, generation, and inbox.</div></div>
+              <details class="instructions"><summary>Base agent instructions</summary><pre id="instructions">Instructions appear when a run is selected.</pre></details>
+              <div class="event-head"><div><span class="section-kicker">Conversation record</span><h3>Recent transcript</h3></div></div>
+              <div id="transcript" class="list"><div class="empty">No transcript entries yet.</div></div>
+              <p class="privacy-note">Thinking blocks are omitted. Transcript and tool details are available only through this localhost inspector.</p>
+            </section>
+            <section id="view-hands" role="tabpanel" aria-labelledby="tab-hands" tabindex="0" hidden>
+              <div class="event-head"><div><span class="section-kicker">Registered with Pi Durable</span><h3>Loaded tools</h3></div></div>
+              <p class="hint">Replay shows each tool’s configured policy. It does not predict whether a specific call will replay.</p>
+              <div id="tools" class="list"><div class="empty">Loaded tool registrations appear here.</div></div>
+              <div class="event-head"><div><span class="section-kicker">Inside Code Mode</span><h3>Nested tools</h3></div></div>
+              <p class="hint">These namespaced tools run inside one top-level <code>code_mode</code> operation.</p>
+              <div id="nested-tools" class="list"><div class="empty">Nested tools appear here.</div></div>
+              <div class="event-head"><div><span class="section-kicker">Right now</span><h3>Current calls</h3></div></div>
+              <div id="calls" class="list"><div class="empty">No active tool calls.</div></div>
+            </section>
+          </section>
         </div>
-        <p class="hint">The 5s deadline uses a durable Agent schedule; “Fire now” tests the same abort path immediately. The OOM-like control aborts the run to exercise failure reporting; it does not cause a real Worker OOM.</p>
       </section>
 
-      <section class="panel" aria-labelledby="log-title">
-        <div class="meta">
-          <div>
-            <div id="status" class="status"><span class="dot"></span><span>No agent yet</span></div>
-            <div id="agent-id" style="margin-top:7px"><code>Launch a run to create an agent.</code></div>
-          </div>
-          <div id="socket" class="socket">log socket: closed</div>
+      <aside class="runbook panel" aria-labelledby="runbook-title">
+        <span class="section-kicker">00 / Runbook</span>
+        <h2 id="runbook-title">Give it useful work.</h2>
+        <p class="panel-intro">The sample task uses the agent’s workspace tools to calculate a restock and write a Markdown plan.</p>
+        <label for="prompt">Task brief</label>
+        <textarea id="prompt">You are helping a small warehouse. A shipment arrived with 8 desk lamps and 3 keyboards. Current stock is 2 desk lamps and 5 keyboards. The target stock is 6 lamps and 4 keyboards. Use the workspace tools through code_mode to write /restock-plan.md with the quantities to reorder and a short explanation. Then report the file you created and the reorder quantities.</textarea>
+        <div class="action-stack">
+          <button id="launch" class="primary">Launch durable run <span aria-hidden="true">↗</span></button>
+          <button id="new-run" disabled>Start fresh run</button>
         </div>
-        <div class="tabs" role="tablist" aria-label="Agent inspection views">
-          <button class="tab active" data-tab="log" role="tab" aria-selected="true">Event log</button>
-          <button class="tab" data-tab="brain" role="tab" aria-selected="false">Brain</button>
-          <button class="tab" data-tab="hands" role="tab" aria-selected="false">Hands</button>
-          <button id="clear-view" style="margin:0 0 5px auto" title="Clear only the visible log">Clear view</button>
-        </div>
-        <section id="view-log" role="tabpanel">
-          <div id="events" class="events" aria-live="polite">
-            <div class="empty">Agent lifecycle events will appear here. Event history is stored with the Durable Object and replayed after reconnect.</div>
-          </div>
-          <div class="answer"><div class="answer-title">Latest agent response</div><pre id="answer">Waiting for a run to finish.</pre></div>
-        </section>
-        <section id="view-brain" role="tabpanel" hidden>
-          <div id="brain-summary" class="state-grid"><div class="empty">Launch a run to inspect the Pi Durable session.</div></div>
-          <details class="instructions"><summary>Base agent instructions</summary><pre id="instructions"></pre></details>
-          <div class="event-head"><h2>Recent transcript</h2></div>
-          <div id="transcript" class="list"></div>
-          <p class="hint">Thinking blocks are omitted. User, assistant, and tool text is shown only in this localhost inspector.</p>
-        </section>
-        <section id="view-hands" role="tabpanel" hidden>
-          <div class="event-head"><h2>Loaded tools and replay policy</h2></div>
-          <p class="hint" style="margin:0 0 10px">This shows each tool's configured policy, not a prediction of which individual call will replay. Safe calls may rerun after interruption. Unsafe calls are not automatically replayed. An omitted policy uses Pi Durable's unsafe default.</p>
-          <div id="tools" class="list"><div class="empty">Loaded tool registrations will appear here.</div></div>
-          <div class="event-head"><h2>Tools inside code_mode</h2></div>
-          <p class="hint" style="margin:0 0 10px">These are Code Mode's namespaced tools. Their retry boundary is the top-level code_mode call above.</p>
-          <div id="nested-tools" class="list"><div class="empty">Nested tools will appear here.</div></div>
-          <div class="event-head"><h2>Current tool calls</h2></div>
-          <div id="calls" class="list"><div class="empty">No active tool calls.</div></div>
-        </section>
-      </section>
+        <p class="hint">Launch returns when PiHarness has durably accepted the work. The run continues if you disconnect this page.</p>
+
+        <div class="rule-break"></div>
+        <span class="section-kicker">03 / Experiments</span>
+        <h3>Change one condition.</h3>
+        <p class="panel-intro">Each experiment has a visible runtime consequence. Controls unlock when the selected run is active.</p>
+
+        <article class="experiment">
+          <div><span class="experiment-index">A</span><div><strong>Leave the observer</strong><p>Close only this event socket. PiHarness keeps working.</p></div></div>
+          <div class="buttons"><button id="disconnect" disabled>Disconnect viewer</button><button id="reconnect" disabled>Reconnect + replay</button></div>
+        </article>
+        <article class="experiment">
+          <div><span class="experiment-index">B</span><div><strong>Apply a deadline</strong><p>Schedule a durable app timer that aborts the current operation in five seconds.</p></div></div>
+          <div class="buttons"><button id="arm-timeout" class="warn" disabled>Arm 5-second deadline</button><button id="timeout" class="warn" disabled>Abort now</button></div>
+        </article>
+        <article class="experiment experiment-danger">
+          <div><span class="experiment-index">C</span><div><strong>Simulate a resource limit</strong><p>This sends PiHarness an abort and labels the event as a simulation. It does not trigger a platform OOM.</p></div></div>
+          <div class="buttons"><button id="oom" class="danger" disabled>Abort · simulate OOM</button></div>
+        </article>
+      </aside>
     </div>
 
-    <section class="notes" aria-label="Event semantics">
-      <div class="note"><strong>Disconnect is real</strong>The browser closes its WebSocket and stops inspector polling. PiHarness work was accepted separately, so the run continues with no client attached.</div>
-      <div class="note"><strong>Deadline is an app action</strong>The control calls PiHarness abort for the active operation. It demonstrates cooperative cancellation and the resulting status.</div>
-      <div class="note"><strong>OOM is approximated</strong>A real platform OOM can terminate a Worker before it logs anything. This safe control marks the injected failure clearly instead of pretending to cause one.</div>
-      <div class="note"><strong>Try a restart</strong>Keep a run active, restart <code>wrangler dev</code>, then reload this page. The saved agent ID reconnects to the same local Durable Object.</div>
-    </section>
+    <footer class="notes" aria-label="How to read this instrument">
+      <div class="note"><strong>Durable means saved</strong>Events are kept by the agent and sent again when the viewer reconnects.</div>
+      <div class="note"><strong>Deadline means abort</strong>This app-level timer calls PiHarness abort. It is not a Cloudflare execution timeout.</div>
+      <div class="note"><strong>Replay is policy</strong>The Hands view shows configured tool policy; the actual replay decision depends on the operation state.</div>
+      <div class="note"><strong>OOM is simulated</strong>A real Worker memory limit may stop execution before application code can write a log.</div>
+    </footer>
   </main>
-
-  <script type="module">
-    const $ = (id) => document.getElementById(id);
-    const eventsEl = $("events");
-    let agentId = "";
-    let socket;
-    let seen = new Set();
-    let statusTimer;
-
-    function addEvent(event) {
-      if (!event?.id || seen.has(event.id)) return;
-      seen.add(event.id);
-      const empty = eventsEl.querySelector(".empty");
-      if (empty) empty.remove();
-      const row = document.createElement("div");
-      row.className = `event ${event.level || "info"}`;
-      const date = new Date(event.at);
-      const time = Number.isNaN(date.getTime()) ? "--:--:--" : date.toLocaleTimeString();
-      const timeEl = document.createElement("span");
-      timeEl.className = "time";
-      timeEl.textContent = time;
-      const body = document.createElement("div");
-      const title = document.createElement("span");
-      title.className = "event-name";
-      title.textContent = event.type || "event";
-      body.append(title);
-      if (event.operationId) {
-        const op = document.createElement("span");
-        op.className = "detail";
-        op.textContent = `operation ${event.operationId}`;
-        body.append(op);
-      }
-      if (event.details && Object.keys(event.details).length) {
-        const detail = document.createElement("span");
-        detail.className = "detail";
-        detail.textContent = Object.entries(event.details).map(([key, value]) => `${key}: ${value}`).join(" · ");
-        body.append(detail);
-      }
-      row.append(timeEl, body);
-      eventsEl.append(row);
-      eventsEl.scrollTop = eventsEl.scrollHeight;
-    }
-
-    function setSocketState(value) { $("socket").textContent = `log socket: ${value}`; }
-    function setStatus(status) {
-      const dot = $("status").querySelector(".dot");
-      const label = $("status").lastElementChild;
-      dot.className = `dot ${status?.status || ""}`;
-      label.textContent = status?.status || "unknown";
-      if (status?.lastError) label.title = status.lastError;
-      if (status?.operationId) $("agent-id").innerHTML = `<code>${agentId}</code><span class="detail">operation ${status.operationId}</span>`;
-      if (status?.lastResponse) $("answer").textContent = status.lastResponse;
-      if (status?.lastError) $("answer").textContent = `Run failed: ${status.lastError}`;
-    }
-
-    function addStateCard(parent, label, value) {
-      const card = document.createElement("div");
-      card.className = "state-card";
-      const labelEl = document.createElement("div");
-      labelEl.className = "state-label";
-      labelEl.textContent = label;
-      const valueEl = document.createElement("div");
-      valueEl.className = "state-value";
-      valueEl.textContent = value;
-      card.append(labelEl, valueEl);
-      parent.append(card);
-    }
-
-    function renderInspection(data) {
-      const brain = data.brain;
-      const model = brain.model ? `${brain.model.provider}/${brain.model.modelId}` : "not selected yet";
-      const summary = $("brain-summary");
-      summary.replaceChildren();
-      addStateCard(summary, "Model", model);
-      addStateCard(summary, "Thinking", brain.thinkingLevel || "default");
-      addStateCard(summary, "Sessions", (brain.sessions || []).map((s) => `${s.id}${s.busy ? " · busy" : ""}`).join(", ") || "none");
-      addStateCard(summary, "Pending submissions", (brain.pending || []).map((p) => `${p.status} · ${p.operationId}`).join("\n") || "none");
-      addStateCard(summary, "Extensions", Array.isArray(brain.extensions) ? (brain.extensions.join(", ") || "host defaults") : JSON.stringify(brain.extensions));
-      addStateCard(summary, "Usage", JSON.stringify(brain.usage || {}));
-      const generation = brain.live?.generation;
-      addStateCard(summary, "Generation", generation ? `attempt ${generation.attempt}${generation.retry ? ` · retry ${generation.retry.at}` : ""}${generation.deferred ? ` · deferred until ${generation.deferred.pollAt}` : ""}` : "idle");
-      addStateCard(summary, "Inbox", (brain.live?.inbox || []).length ? `${brain.live.inbox.length} queued item(s)` : "empty");
-      $("instructions").textContent = brain.instructions || "No base instructions are configured.";
-      const transcript = $("transcript");
-      transcript.replaceChildren();
-      const rows = (brain.transcript || []).flatMap((entry) => (entry.messages || []).map((message) => ({ entry, message })));
-      if (!rows.length) transcript.innerHTML = '<div class="empty">No transcript entries yet.</div>';
-      for (const { entry, message } of rows.slice(-30)) {
-        const row = document.createElement("div");
-        row.className = "list-row";
-        const title = document.createElement("strong");
-        title.textContent = `${message.role} · ${entry.kind}`;
-        const text = document.createElement("pre");
-        text.textContent = message.content || "(no display text)";
-        row.append(title, text);
-        transcript.append(row);
-      }
-
-      const tools = $("tools");
-      tools.replaceChildren();
-      for (const item of data.hands.loadedTools || []) {
-        const row = document.createElement("div");
-        row.className = "list-row";
-        const title = document.createElement("strong");
-        title.textContent = item.name;
-        const extension = document.createElement("span");
-        extension.className = "detail";
-        extension.textContent = `extension: ${item.extension}`;
-        const replay = document.createElement("span");
-        replay.className = "pill";
-        replay.textContent = `replay: ${item.replay}`;
-        const mode = document.createElement("span");
-        mode.className = "pill";
-        mode.textContent = `execution: ${item.executionMode}`;
-        const selected = document.createElement("span");
-        selected.className = "pill";
-        selected.textContent = item.selected ? "selected" : "not selected";
-        row.append(title, extension, replay, mode, selected);
-        tools.append(row);
-      }
-      if (!tools.childElementCount) tools.innerHTML = '<div class="empty">No tools are registered yet.</div>';
-
-      const nestedTools = $("nested-tools");
-      nestedTools.replaceChildren();
-      for (const item of data.hands.nestedTools || []) {
-        const row = document.createElement("div");
-        row.className = "list-row";
-        const title = document.createElement("strong");
-        title.textContent = `${item.group}.${item.name}`;
-        const description = document.createElement("span");
-        description.className = "detail";
-        description.textContent = item.description;
-        row.append(title, description);
-        nestedTools.append(row);
-      }
-      if (!nestedTools.childElementCount) nestedTools.innerHTML = '<div class="empty">No nested tools are available.</div>';
-
-      const calls = $("calls");
-      calls.replaceChildren();
-      for (const call of data.hands.currentCalls || []) {
-        const row = document.createElement("div");
-        row.className = "list-row";
-        const title = document.createElement("strong");
-        title.textContent = `${call.name} · ${call.status}`;
-        row.append(title);
-        if (call.output) { const output = document.createElement("pre"); output.textContent = call.output; row.append(output); }
-        if (call.diagnostics?.length) { const diagnostics = document.createElement("pre"); diagnostics.textContent = JSON.stringify(call.diagnostics, null, 2); row.append(diagnostics); }
-        calls.append(row);
-      }
-      if (!calls.childElementCount) calls.innerHTML = '<div class="empty">No active tool calls.</div>';
-    }
-
-    async function refreshStatus() {
-      if (!agentId) return;
-      try {
-        const response = await fetch(`/agents/${agentId}`);
-        if (response.ok) setStatus(await response.json());
-      } catch { /* The WebSocket and durable event log report connection failures. */ }
-    }
-
-    async function refreshInspection() {
-      if (!agentId) return;
-      try {
-        const response = await fetch(`/agents/${agentId}/inspect`);
-        if (response.ok) renderInspection(await response.json());
-      } catch { /* The inspector refreshes again on its next tick. */ }
-    }
-
-    function startInspectionPolling() {
-      clearInterval(statusTimer);
-      statusTimer = setInterval(() => { refreshStatus(); refreshInspection(); }, 1200);
-      refreshStatus();
-      refreshInspection();
-    }
-
-    function connect() {
-      if (!agentId) return;
-      if (socket && socket.readyState < WebSocket.CLOSING) socket.close(1000, "Reconnect requested");
-      const scheme = location.protocol === "https:" ? "wss:" : "ws:";
-      const nextSocket = new WebSocket(`${scheme}//${location.host}/agents/pi-agent/${agentId}`);
-      socket = nextSocket;
-      setSocketState("connecting");
-      nextSocket.onopen = () => { if (socket === nextSocket) { setSocketState("connected"); startInspectionPolling(); } };
-      nextSocket.onmessage = (message) => { try { addEvent(JSON.parse(message.data)); } catch { /* Ignore non-event frames. */ } };
-      nextSocket.onclose = () => {
-        if (socket !== nextSocket) return;
-        setSocketState("closed");
-        clearInterval(statusTimer);
-        statusTimer = undefined;
-      };
-      nextSocket.onerror = () => setSocketState("error");
-    }
-
-    async function launch() {
-      const button = $("launch");
-      button.disabled = true;
-      button.textContent = "Starting…";
-      try {
-        const response = await fetch("/agents", {
-          method: "POST", headers: { "content-type": "application/json" },
-          body: JSON.stringify({ prompt: $("prompt").value.trim() }),
-        });
-        const result = await response.json();
-        if (!response.ok) throw new Error(result.error || "Could not launch agent");
-        agentId = result.agentId;
-        localStorage.setItem("pi-cloudflare-demo-agent", agentId);
-        seen = new Set();
-        eventsEl.replaceChildren();
-        $("answer").textContent = "Waiting for a run to finish.";
-        $("agent-id").innerHTML = `<code>${agentId}</code>`;
-        setStatus({ status: "running", operationId: result.operationId });
-        connect();
-      } catch (error) {
-        addEvent({ id: crypto.randomUUID(), at: new Date().toISOString(), type: "demo.launch.failed", level: "error", details: { message: error.message } });
-      } finally {
-        button.disabled = false;
-        button.textContent = "Launch durable run";
-      }
-    }
-
-    async function interrupt(cause) {
-      if (!agentId) return;
-      try {
-        const response = await fetch(`/agents/${agentId}/interrupt`, {
-          method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ cause }),
-        });
-        const result = await response.json();
-        if (!response.ok) throw new Error(result.error || "Could not interrupt run");
-        if (!result.interrupted) addEvent({ id: crypto.randomUUID(), at: new Date().toISOString(), type: "demo.interrupt.no_active_run", level: "warn", details: { cause } });
-        await refreshStatus();
-      } catch (error) {
-        addEvent({ id: crypto.randomUUID(), at: new Date().toISOString(), type: "demo.interrupt.failed", level: "error", details: { message: error.message } });
-      }
-    }
-
-    async function armDeadline() {
-      if (!agentId) return;
-      try {
-        const response = await fetch(`/agents/${agentId}/deadline`, {
-          method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ seconds: 5 }),
-        });
-        const result = await response.json();
-        if (!response.ok) throw new Error(result.error || "Could not arm deadline");
-        if (!result.scheduled) addEvent({ id: crypto.randomUUID(), at: new Date().toISOString(), type: "demo.deadline.no_active_run", level: "warn" });
-      } catch (error) {
-        addEvent({ id: crypto.randomUUID(), at: new Date().toISOString(), type: "demo.deadline.arm_failed", level: "error", details: { message: error.message } });
-      }
-    }
-
-    $("launch").addEventListener("click", launch);
-    $("new-run").addEventListener("click", launch);
-    $("disconnect").addEventListener("click", () => socket?.close(1000, "Demo viewer disconnected"));
-    $("reconnect").addEventListener("click", connect);
-    $("timeout").addEventListener("click", () => interrupt("deadline"));
-    $("arm-timeout").addEventListener("click", armDeadline);
-    $("oom").addEventListener("click", () => interrupt("resource-limit"));
-    $("clear-view").addEventListener("click", () => { seen.clear(); eventsEl.innerHTML = '<div class="empty">Visible rows cleared. Reconnect to replay the Durable Object event history.</div>'; });
-    document.querySelectorAll("[data-tab]").forEach((button) => button.addEventListener("click", () => {
-      for (const tab of document.querySelectorAll("[data-tab]")) {
-        const selected = tab === button;
-        tab.classList.toggle("active", selected);
-        tab.setAttribute("aria-selected", String(selected));
-      }
-      for (const name of ["log", "brain", "hands"]) $(`view-${name}`).hidden = button.dataset.tab !== name;
-    }));
-
-    const savedAgentId = localStorage.getItem("pi-cloudflare-demo-agent");
-    if (savedAgentId && /^[a-f0-9-]+$/.test(savedAgentId)) {
-      agentId = savedAgentId;
-      $("agent-id").innerHTML = `<code>${agentId}</code>`;
-      connect();
-    }
-  </script>
 </body>
 </html>

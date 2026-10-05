@@ -17,7 +17,7 @@ import { z } from "zod";
 import { withCloudflareSpan, withObservability } from "./observability";
 import type { AgentEvent, AgentInspection, AgentStatus, DemoInterrupt, Env } from "./types";
 
-const DEFAULT_MODEL = "@cf/zai-org/glm-4.7-flash";
+const DEFAULT_MODEL = "@cf/zai-org/glm-5.3-flash";
 const CORE_EXTENSION = "cloudflare-agent-tools";
 const SUBAGENT_EXTENSION = "durable-subagents";
 const SYSTEM_PROMPT = `You are a careful, resourceful agent running on Pi Durable. Your conversation, tasks, and submissions are durable and resumable. You have a persistent workspace, a resumable Linux sandbox, web search, browser access, and connected MCP tools. Use code_mode to combine short multi-step tool work. Keep durable facts that will help future runs in /memory.md in the workspace. Work in small verified steps, and report important actions and errors clearly.`;
@@ -438,8 +438,15 @@ function assistantEntryText(entry: EntryRecord | undefined): string {
 }
 
 function inspectMessage(message: EntryRecord["model"] extends readonly (infer Message)[] | undefined ? Message : never) {
-	const value = message as unknown as { role?: string; content?: unknown[] };
-	const parts = value.content ?? [];
+	const value = message as unknown as { role?: string; content?: unknown };
+	const rawContent = value.content;
+	const parts = Array.isArray(rawContent)
+		? rawContent
+		: typeof rawContent === "string"
+			? [{ type: "text", text: rawContent }]
+			: rawContent && typeof rawContent === "object"
+				? ("type" in rawContent ? [rawContent] : Object.values(rawContent))
+				: [];
 	const content = parts.flatMap((part) => {
 		if (!part || typeof part !== "object") return [];
 		const record = part as Record<string, unknown>;
