@@ -58,10 +58,12 @@ Use Node.js 22.19+ or 24.11+.
 
 ```sh
 npm ci
-npx wrangler dev
+npm run dev
 ```
 
-Wrangler bindings are declared in `wrangler.jsonc`: Durable Objects, Workers AI, Browser, Worker Loader, Containers, and Artifacts. Create or select the Cloudflare resources required by those bindings before deploying. The Artifacts namespace is set to `default` in the config; change it if your namespace has another name.
+Open [http://localhost:8787](http://localhost:8787) for the Runtime Event Lab. It launches a real Pi Durable run for a small warehouse restock task. The local run needs the configured Workers AI binding to be available.
+
+Wrangler bindings are declared in `wrangler.jsonc`: Durable Objects, Workers AI, Browser, Worker Loader, Containers, and Artifacts. Workers AI and Browser use remote bindings during local development because they have no local simulator; Wrangler still runs the Worker code on your machine. This needs Cloudflare login and uses real Cloudflare services, which can incur charges. Create or select the Cloudflare resources required by those bindings before deploying. The Artifacts namespace is set to `default` in the config; change it if your namespace has another name.
 
 Optional settings:
 
@@ -83,6 +85,22 @@ Deploy with `npx wrangler deploy`. The HTTP API does not add authentication; pro
 
 The repository's `.npmrc` allows fresh package releases. This setting applies only in this repository.
 
+## Runtime Event Lab
+
+The home page is a hands-on view of one agent run:
+
+1. Launch the warehouse task. The agent writes a restock plan through its workspace tools.
+2. Watch the live event log and final response. Events are also saved with the agent and replayed when its WebSocket reconnects.
+3. Disconnect and reconnect the log socket while the durable task runs. The submitted PiHarness operation is separate from that viewer connection.
+4. Arm a five-second durable deadline or trigger it immediately to abort the active Pi operation and inspect its terminal status.
+5. Inject an OOM-like failure to exercise error reporting. This uses PiHarness abort; it does **not** cause a real Worker memory limit or process crash.
+
+The **Brain** view shows the active Pi model, session tree, pending submissions, usage, and recent transcript. The **Hands** view shows registered tools, their configured replay policies, and current tool calls. Replay labels describe the tool policy; they do not predict which individual call is queued to replay. The views refresh while the log socket is connected. These inspection routes and the demo WebSocket work only from `localhost`; they do not expose transcript or tool state from a deployed Worker.
+
+Cloudflare can terminate a Worker before application code records a true out-of-memory failure. To observe real restarts, keep a run active, restart `wrangler dev`, and reopen the page; the page remembers the agent ID locally and reconnects to the same persisted local Durable Object.
+
+The demo stores up to 300 structured events per agent. Wrangler logs and traces remain enabled for request-level details.
+
 ## HTTP API
 
 Start an agent:
@@ -100,6 +118,12 @@ The `202` response includes an `agentId` and `operationId`. The launch continues
 | `POST /agents` with `{"prompt":"..."}` | Launch a new agent; returns its IDs |
 | `GET /agents` | List launched agent IDs and creation times |
 | `GET /agents/:id` | Read status and the latest response or error |
+| `GET /agents/:id/events` (localhost only) | Read the agent's saved event history |
+| `GET /agents/:id/inspect` (localhost only) | Inspect Pi Durable session state and tool registrations |
 | `POST /agents/:id/run` with `{"prompt":"..."}` | Send a prompt to that agent and wait for its response |
+| `POST /agents/:id/interrupt` with `{"cause":"deadline"}` (localhost only) | Abort the active PiHarness operation |
+| `POST /agents/:id/interrupt` with `{"cause":"resource-limit"}` (localhost only) | Inject a labeled OOM-like failure and abort the active operation |
+| `POST /agents/:id/deadline` with `{"seconds":5}` (localhost only) | Schedule a durable deadline for the active operation |
+| WebSocket `/agents/pi-agent/:id` (localhost only) | Receive saved events and live lifecycle events |
 
 Statuses are `idle`, `running`, `complete`, or `failed`. Prompts must be non-empty strings.

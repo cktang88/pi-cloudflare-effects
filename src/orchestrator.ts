@@ -1,7 +1,7 @@
 import { Agent as DurableAgent, getAgentByName } from "agents";
 import { Effect } from "effect";
 import { withCloudflareSpan, withObservability } from "./observability";
-import type { AgentStatus, Env, LaunchResult, RunResult } from "./types";
+import type { AgentEvent, AgentInspection, AgentStatus, DemoInterrupt, Env, LaunchResult, RunResult } from "./types";
 
 const AGENT_PREFIX = "pi-agent:";
 
@@ -36,6 +36,28 @@ export class Orchestrator extends DurableAgent<Env> {
 			const agent = await this.findAgent(agentId);
 			return agent ? agent.getStatus() : null;
 		});
+	}
+
+	async getAgentEvents(agentId: string): Promise<AgentEvent[] | null> {
+		const agent = await this.findAgent(agentId);
+		return agent ? agent.getEvents() : null;
+	}
+
+	async inspectAgent(agentId: string): Promise<AgentInspection | null> {
+		const agent = await this.findAgent(agentId);
+		return agent ? agent.inspectBrainAndHands() : null;
+	}
+
+	async interruptDemoRun(agentId: string, cause: DemoInterrupt) {
+		const agent = await this.findAgent(agentId);
+		if (!agent) throw new Error(`Agent ${agentId} not found`);
+		return agent.interruptDemoRun(cause);
+	}
+
+	async armDemoDeadline(agentId: string, seconds: number) {
+		const agent = await this.findAgent(agentId);
+		if (!agent) throw new Error(`Agent ${agentId} not found`);
+		return agent.armDemoDeadline(seconds);
 	}
 
 	async listAgents(): Promise<Array<{ name: string; createdAt: number }>> {

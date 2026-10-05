@@ -7,7 +7,7 @@ import { createCodeTool } from "@cloudflare/codemode/ai";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { Type } from "@earendil-works/pi-ai";
 import { configure, createRegistry, defineExtension, defineTool, Harness, section, type EntryRecord, type ToolRegistration } from "@earendil-works/pi-durable";
-import { Agent as DurableAgent, type AgentContext } from "agents";
+import { Agent as DurableAgent, type AgentContext, type Connection } from "agents";
 import { PiHarness, type PiHarnessContext } from "agents/harness/pi";
 import { createBrowserTools } from "agents/browser/ai";
 import { createAI } from "agents/models/pi-ai";
@@ -15,7 +15,7 @@ import { tool } from "ai";
 import { Effect } from "effect";
 import { z } from "zod";
 import { withCloudflareSpan, withObservability } from "./observability";
-import type { AgentStatus, Env } from "./types";
+import type { AgentEvent, AgentInspection, AgentStatus, DemoInterrupt, Env } from "./types";
 
 const DEFAULT_MODEL = "@cf/zai-org/glm-4.7-flash";
 const CORE_EXTENSION = "cloudflare-agent-tools";
@@ -30,6 +30,7 @@ type AiTool = {
 
 export class PiAgent extends DurableAgent<Env> {
 	private mcpServersAdded = false;
+	private nestedToolGroups: AgentInspection["hands"]["nestedTools"] = [];
 	readonly ai = createAI({ binding: this.env.AI });
 	readonly registry = createRegistry();
 	readonly workspace = new Workspace({
@@ -61,6 +62,31 @@ export class PiAgent extends DurableAgent<Env> {
 		if (!(await this.ctx.storage.get<AgentStatus>("agent:status"))) {
 			await this.saveStatus({ status: "idle" });
 		}
+	}
+
+	async onConnect(connection: Connection): Promise<void> {
+		for (const event of await this.getEvents()) connection.send(JSON.stringify(event));
+		await this.recordEvent("client.connected", { connectionId: connection.id });
+	}
+
+	async onMessage(connection: Connection, message: string | ArrayBuffer): Promise<void> {
+		if (message === "ping") connection.send("pong");
+	}
+
+	async onClose(connection: Connection, code: number, reason: string, wasClean: boolean): Promise<void> {
+		await this.recordEvent("client.disconnected", {
+			connectionId: connection.id,
+			code,
+			reason: reason.slice(0, 120),
+			wasClean,
+		}, wasClean ? "info" : "warn");
+	}
+
+	async onError(connectionOrError: Connection | unknown, error?: unknown): Promise<void> {
+		const cause = error ?? connectionOrError;
+		await this.recordEvent("agent.websocket.error", {
+			message: cause instanceof Error ? cause.message : String(cause),
+		}, "error");
 	}
 
 	private async connectMcpServers(): Promise<void> {
@@ -125,6 +151,7 @@ export class PiAgent extends DurableAgent<Env> {
 			backends: { shell: { description: "Persistent workspace files and Artifacts Git repositories." } },
 		} });
 		const browserTools = createBrowserTools({ ctx: this.ctx, browser: this.env.BROWSER, loader: this.env.LOADER, session: { mode: "dynamic" } });
+		const mcpTools = this.mcp.getAITools();
 		const webSearch = tool({
 			description: "Search the live web for current facts and sources.",
 			inputSchema: z.object({ query: z.string().min(1).max(1024), limit: z.number().int().min(1).max(10).optional() }),
@@ -133,11 +160,17 @@ export class PiAgent extends DurableAgent<Env> {
 				return response.json();
 			},
 		});
+		this.nestedToolGroups = [
+			...describeToolSet("workspace", computerTools),
+			...describeToolSet("browser", browserTools),
+			...describeToolSet("mcp", mcpTools),
+			{ group: "web", name: "search", description: "Search the live web for current facts and sources." },
+		];
 		const codeMode = createCodeTool({
 			tools: [
 				{ name: "workspace", tools: computerTools },
 				{ name: "browser", tools: browserTools },
-				{ name: "mcp", tools: this.mcp.getAITools() },
+				{ name: "mcp", tools: mcpTools },
 				{ name: "web", tools: { search: webSearch } },
 			],
 			executor: new DynamicWorkerExecutor({ loader: this.env.LOADER }),
@@ -257,6 +290,109 @@ export class PiAgent extends DurableAgent<Env> {
 		return (await this.ctx.storage.get<AgentStatus>("agent:status")) ?? status;
 	}
 
+	async getEvents(): Promise<AgentEvent[]> {
+		return (await this.ctx.storage.get<AgentEvent[]>("agent:events")) ?? [];
+	}
+
+	async inspectBrainAndHands(): Promise<AgentInspection> {
+		const session = this.piHarness.session();
+		const eventStream = await session.events();
+		const snapshot = eventStream.snapshot;
+		await eventStream.stop();
+		const [entries, pending, sessions] = await Promise.all([
+			session.messages(),
+			this.piHarness.pending(),
+			this.piHarness.sessions.list(),
+		]);
+		const registry = this.registry.snapshot();
+		const extensionChoice = snapshot.agent.extensions;
+		const defaultExtensions = registry.installed().map((extension) => extension.name);
+		const selectedExtensions = new Set(Array.isArray(extensionChoice)
+			? extensionChoice
+			: [...defaultExtensions, ...(extensionChoice?.add ?? [])].filter((name) => !extensionChoice?.remove?.includes(name)));
+		const toolChoice = snapshot.agent.tools;
+		const defaultTools = registry.tools().filter(({ extension }) => selectedExtensions.has(extension.name)).map(({ tool }) => tool.name);
+		const selectedTools = new Set(Array.isArray(toolChoice)
+			? toolChoice
+			: defaultTools.filter((name) => !toolChoice?.remove?.includes(name)));
+		const tools = registry.tools().map(({ extension, tool }) => ({
+			extension: extension.name,
+			name: tool.name,
+			replay: tool.replay ?? "unsafe (default)",
+			executionMode: tool.executionMode ?? "configured default",
+				selected: selectedExtensions.has(extension.name) && selectedTools.has(tool.name),
+		}));
+		return {
+			brain: {
+				model: snapshot.agent.model ? { provider: snapshot.agent.model.provider, modelId: snapshot.agent.model.modelId } : null,
+				thinkingLevel: snapshot.agent.thinkingLevel ?? null,
+				extensions: [...selectedExtensions],
+				instructions: SYSTEM_PROMPT,
+				usage: snapshot.usage,
+				sessions,
+				pending,
+				transcript: entries.slice(-30).map((entry) => ({
+					id: String(entry.id),
+					kind: entry.kind,
+					messages: (entry.model ?? []).map(inspectMessage),
+				})),
+				live: {
+					generation: snapshot.generation ? {
+						attempt: snapshot.generation.attempt,
+						...(snapshot.generation.retry ? { retry: snapshot.generation.retry } : {}),
+						...(snapshot.generation.deferred ? { deferred: snapshot.generation.deferred } : {}),
+					} : null,
+					inbox: snapshot.inbox,
+				},
+			},
+			hands: {
+				loadedTools: tools,
+				nestedTools: this.nestedToolGroups,
+				currentCalls: (snapshot.tools ?? []).map((slot) => ({
+					name: slot.name,
+					status: slot.status,
+					...(slot.output ? { output: slot.output.slice(-2_000) } : {}),
+					...(slot.diagnostics?.length ? { diagnostics: slot.diagnostics } : {}),
+				})),
+			},
+		};
+	}
+
+	async interruptDemoRun(cause: DemoInterrupt): Promise<{ interrupted: boolean; operationId?: string }> {
+		const status = await this.getStatus();
+		if (status.status !== "running" || !status.operationId) return { interrupted: false };
+		const details: Record<string, string | number | boolean> = cause === "deadline"
+			? { source: "demo deadline control", action: "PiHarness.abort" }
+			: { source: "demo fault injection", action: "PiHarness.abort", simulation: "resource limit only; no real Worker OOM" };
+		await this.recordEvent(cause === "deadline" ? "demo.deadline.fired" : "demo.resource_limit.injected", details, "warn", status.operationId);
+		const interrupted = await this.piHarness.abort({ operationId: status.operationId });
+		return { interrupted, operationId: status.operationId };
+	}
+
+	async armDemoDeadline(seconds: number): Promise<{ scheduled: boolean; operationId?: string; deadlineAt?: string }> {
+		const status = await this.getStatus();
+		if (status.status !== "running" || !status.operationId) return { scheduled: false };
+		const storageKey = `demo:deadline:${status.operationId}`;
+		const previousDeadline = await this.ctx.storage.get<string>(storageKey);
+		if (previousDeadline) await this.cancelSchedule(previousDeadline);
+		const deadlineAt = new Date(Date.now() + seconds * 1_000);
+		const schedule = await this.schedule(deadlineAt, "expireDemoDeadline", { operationId: status.operationId }, { idempotent: false });
+		await this.ctx.storage.put(storageKey, schedule.id);
+		await this.recordEvent("demo.deadline.armed", { seconds, deadlineAt: deadlineAt.toISOString() }, "info", status.operationId);
+		return { scheduled: true, operationId: status.operationId, deadlineAt: deadlineAt.toISOString() };
+	}
+
+	async expireDemoDeadline(payload: { operationId: string }): Promise<void> {
+		await this.ctx.storage.delete(`demo:deadline:${payload.operationId}`);
+		const status = await this.ctx.storage.get<AgentStatus>("agent:status");
+		if (status?.status !== "running" || status.operationId !== payload.operationId) {
+			await this.recordEvent("demo.deadline.expired_after_completion", {}, "info", payload.operationId);
+			return;
+		}
+		const interrupted = await this.piHarness.abort({ operationId: payload.operationId });
+		await this.recordEvent("demo.deadline.fired", { source: "durable Agent schedule", interrupted }, "warn", payload.operationId);
+	}
+
 	private async saveStatus(update: Partial<AgentStatus> & Pick<AgentStatus, "status">): Promise<void> {
 		const previous = await this.ctx.storage.get<AgentStatus>("agent:status");
 		const status: AgentStatus = {
@@ -268,7 +404,30 @@ export class PiAgent extends DurableAgent<Env> {
 		};
 		if (update.status === "running") status.lastResponse = previous?.lastResponse;
 		await this.ctx.storage.put("agent:status", status);
-		console.log(JSON.stringify({ event: "agent.status", ...status }));
+		if ((status.status === "complete" || status.status === "failed") && status.operationId) {
+			const deadlineId = await this.ctx.storage.get<string>(`demo:deadline:${status.operationId}`);
+			if (deadlineId && await this.cancelSchedule(deadlineId)) await this.ctx.storage.delete(`demo:deadline:${status.operationId}`);
+		}
+		await this.recordEvent(`agent.status.${status.status}`, {
+			...(status.lastError ? { message: status.lastError } : {}),
+		}, status.status === "failed" ? "error" : "info", status.operationId);
+	}
+
+	private async recordEvent(
+		type: string,
+		details: Record<string, string | number | boolean>,
+		level: AgentEvent["level"] = "info",
+		operationId?: string,
+	): Promise<void> {
+		const event: AgentEvent = {
+			id: crypto.randomUUID(), at: new Date().toISOString(), type, level,
+			...(operationId ? { operationId } : {}),
+			...(Object.keys(details).length ? { details } : {}),
+		};
+		const events = [...await this.getEvents(), event].slice(-300);
+		await this.ctx.storage.put("agent:events", events);
+		console.log(JSON.stringify({ event: type, agentId: this.name, ...event }));
+		this.broadcast(JSON.stringify(event));
 	}
 }
 
@@ -276,6 +435,31 @@ function assistantEntryText(entry: EntryRecord | undefined): string {
 	const message = entry?.model?.[0];
 	if (message?.role !== "assistant") return "";
 	return message.content.map((part) => part.type === "text" ? part.text : "").join("");
+}
+
+function inspectMessage(message: EntryRecord["model"] extends readonly (infer Message)[] | undefined ? Message : never) {
+	const value = message as unknown as { role?: string; content?: unknown[] };
+	const parts = value.content ?? [];
+	const content = parts.flatMap((part) => {
+		if (!part || typeof part !== "object") return [];
+		const record = part as Record<string, unknown>;
+		if (record.type === "text" && typeof record.text === "string") return [record.text];
+		if (record.type === "toolCall" && typeof record.name === "string") {
+			return [`Tool call: ${record.name}${record.arguments === undefined ? "" : ` ${JSON.stringify(record.arguments)}`}`];
+		}
+		if (record.type === "toolResult") return ["Tool result"];
+		return [];
+	}).join("\n").slice(0, 2_000);
+	return { role: value.role ?? "unknown", content };
+}
+
+function describeToolSet(group: string, tools: object): AgentInspection["hands"]["nestedTools"] {
+	return Object.entries(tools as Record<string, { description?: unknown }>).map(([name, definition]) => {
+		const description = typeof definition.description === "string"
+			? definition.description
+			: definition.description === undefined ? "No description provided." : "Description depends on runtime context.";
+		return { group, name, description };
+	});
 }
 
 function parseMcpServers(value: string | undefined): Array<{ name: string; url: string; headers?: Record<string, string> }> {

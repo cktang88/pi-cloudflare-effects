@@ -1,9 +1,13 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "pi-cloudflare-effects",
-  "main": "src/index.ts",
+	"main": "src/index.ts",
 	"compatibility_date": "2026-10-02",
-  "compatibility_flags": ["nodejs_compat", "experimental"],
+	"compatibility_flags": ["nodejs_compat", "experimental"],
+	"assets": {
+		"directory": "./public",
+		"run_worker_first": ["/agents", "/agents/*"]
+	},
   "observability": {
     "enabled": true,
     "logs": { "enabled": true, "invocation_logs": true },
@@ -21,6 +25,6 @@
     { "tag": "v1", "new_sqlite_classes": ["Orchestrator", "PiAgent"] }
   ],
   "worker_loaders": [{ "binding": "LOADER" }],
-  "ai": { "binding": "AI" },
-  "browser": { "binding": "BROWSER" }
+  "ai": { "binding": "AI", "remote": true },
+  "browser": { "binding": "BROWSER", "remote": true }
 }
