@@ -15,18 +15,34 @@ function showError(title, message) {
   addEvent({ id: crypto.randomUUID(), at: new Date().toISOString(), type: title, level: "error", details: { message: String(message || "Unknown error") } });
 }
 
+function filterEvents() {
+  const query = $("event-search").value.trim().toLocaleLowerCase();
+  const level = $("event-level").value;
+  const rows = [...eventsEl.querySelectorAll(".event")];
+  let visible = 0;
+  for (const row of rows) {
+    const matches = (!query || row.textContent.toLocaleLowerCase().includes(query)) && (!level || row.dataset.level === level);
+    row.hidden = !matches;
+    if (matches) visible++;
+  }
+  $("event-count").textContent = rows.length === visible
+    ? `${rows.length} event${rows.length === 1 ? "" : "s"}`
+    : `${visible} shown · ${rows.length} total`;
+}
+
 function addEvent(event) {
   if (!event?.id || seen.has(event.id)) return;
   seen.add(event.id);
   eventsEl.querySelector(".empty")?.remove();
-  const row = document.createElement("div"); row.className = `event ${event.level || "info"}`;
+  const level = ["warn", "error"].includes(event.level) ? event.level : "info";
+  const row = document.createElement("div"); row.className = `event ${level}`; row.dataset.level = level;
   const date = new Date(event.at);
   const time = document.createElement("span"); time.className = "time"; time.textContent = Number.isNaN(date.getTime()) ? "--:--:--" : date.toLocaleTimeString();
   const body = document.createElement("div");
   const title = document.createElement("span"); title.className = "event-name"; title.textContent = event.type || "event"; body.append(title);
   if (event.operationId) { const op = document.createElement("span"); op.className = "detail"; op.textContent = `operation ${event.operationId}`; body.append(op); }
   if (event.details && Object.keys(event.details).length) { const detail = document.createElement("span"); detail.className = "detail"; detail.textContent = Object.entries(event.details).map(([key, value]) => `${key}: ${value}`).join(" · "); body.append(detail); }
-  row.append(time, body); eventsEl.append(row); eventsEl.scrollTop = eventsEl.scrollHeight;
+  row.append(time, body); eventsEl.append(row); filterEvents(); eventsEl.scrollTop = eventsEl.scrollHeight;
 }
 
 function setSocketState(state) { $("socket").textContent = `viewer: ${state}`; }
@@ -180,7 +196,7 @@ async function launch() {
   requestBusy = true; $("launch").textContent = "Starting…"; $("new-run").textContent = "Starting…"; updateControls();
   try {
     const result = await requestJson("/agents", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ prompt: $("prompt").value.trim() }) });
-    agentId = result.agentId; currentStatus = "running"; localStorage.setItem(agentStorageKey, agentId); seen = new Set(); eventsEl.replaceChildren();
+    agentId = result.agentId; currentStatus = "running"; localStorage.setItem(agentStorageKey, agentId); seen = new Set(); eventsEl.replaceChildren(); filterEvents();
     $("answer").textContent = "Waiting for a run to finish.";
     const code = document.createElement("code"); code.textContent = agentId; $("agent-id").replaceChildren(code);
     setStatus({ status: "running", operationId: result.operationId }); connect();
@@ -211,7 +227,10 @@ $("reconnect").addEventListener("click", connect);
 $("timeout").addEventListener("click", () => interrupt("deadline"));
 $("arm-timeout").addEventListener("click", armDeadline);
 $("oom").addEventListener("click", () => interrupt("resource-limit"));
-$("clear-view").addEventListener("click", () => { seen.clear(); eventsEl.innerHTML = '<div class="empty">Visible rows cleared. Reconnect to replay the Durable Object event history.</div>'; });
+$("event-search").addEventListener("input", filterEvents);
+$("event-level").addEventListener("change", filterEvents);
+$("reset-event-filters").addEventListener("click", () => { $("event-search").value = ""; $("event-level").value = ""; filterEvents(); $("event-search").focus(); });
+$("clear-view").addEventListener("click", () => { seen.clear(); eventsEl.innerHTML = '<div class="empty">Visible rows cleared. Reconnect to replay the Durable Object event history.</div>'; filterEvents(); });
 const tabs = [...document.querySelectorAll('[role="tab"][data-tab]')];
 function selectTab(button, moveFocus = false) {
   for (const tab of tabs) {
@@ -241,3 +260,4 @@ if (savedAgentId && /^[a-f0-9-]+$/.test(savedAgentId)) {
   agentId = savedAgentId; const code = document.createElement("code"); code.textContent = agentId; $("agent-id").replaceChildren(code); setSocketState("reconnecting…"); connect();
 }
 updateControls();
+filterEvents();

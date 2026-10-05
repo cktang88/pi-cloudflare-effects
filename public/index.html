@@ -52,6 +52,12 @@
               </div>
               <span class="trace-key"><i aria-hidden="true"></i> newest at bottom</span>
             </div>
+            <div class="event-controls" role="group" aria-label="Filter run trace">
+              <label for="event-search">Find in trace<input id="event-search" type="search" placeholder="Event, tool, operation…" autocomplete="off"></label>
+              <label for="event-level">Severity<select id="event-level"><option value="">All levels</option><option value="info">Info</option><option value="warn">Warning</option><option value="error">Error</option></select></label>
+              <button id="reset-event-filters" type="button">Reset filters</button>
+              <span id="event-count" class="event-count" role="status" aria-live="polite">0 events</span>
+            </div>
             <div id="events" class="events event-rail" aria-live="polite" aria-relevant="additions">
               <div class="empty"><strong>Awaiting a run</strong><span>Launch the sample task to watch submissions, tool calls, status changes, and reconnect replay arrive in order.</span></div>
             </div>
