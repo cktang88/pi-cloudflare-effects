@@ -17,8 +17,8 @@ HTTP request
 
 The main pieces have separate jobs:
 
-- **Pi Durable** runs the model conversation and durable tasks. Its session files use the agent Durable Object's storage.
-- **Cloudflare Agents** supplies the Durable Object lifecycle, browser and MCP connections, and the wake queue used to resume Pi Durable work.
+- **Pi Durable** runs the model conversation and durable tasks. Its transcript and task tables live in the agent Durable Object's SQLite database.
+- **Cloudflare Agents** supplies the Durable Object lifecycle, browser and MCP connections, and `PiHarness`, which stores Pi's data and wakes it to resume work after eviction or restart.
 - **Cloudflare Code Mode** is one tool offered to Pi Durable. The model can write a short program that combines several tools in one sandbox run.
 - **Computer** provides the persistent workspace and Artifacts Git. The Linux Container is separate; its filesystem is saved as a snapshot after commands and restored when needed.
 
@@ -36,6 +36,8 @@ This project uses **Cloudflare Code Mode**, created with `createCodeTool()` and 
 This is not Pi 1.0's built-in `codemode` extension. Pi Durable has its own extension and tool registration API; Pi's built-in extensions are not loaded automatically. The project also does not create Cloudflare's separate durable Code Mode runtime, which stores Code Mode execution history, approvals, and snippets. Pi Durable still persists the agent's conversation and tasks.
 
 The Worker exports Cloudflare's `CodemodeRuntime` class for the Code Mode facet system, but the agent currently uses `DynamicWorkerExecutor` with `createCodeTool()`. See the [Pi changelog](https://pi.dev/changelog), [Pi Code Mode package](https://github.com/earendil-works/pi/blob/main/packages/codemode/README.md), and [Cloudflare Code Mode](https://github.com/cloudflare/agents/tree/main/packages/codemode).
+
+Pi's lifecycle integration uses Cloudflare Agents' beta [`PiHarness`](https://developers.cloudflare.com/agents/harnesses/pi/). This owns the SQLite-backed Pi storage and recovery queue. The Worker keeps its HTTP API and tool extensions around that harness. Sessions from the earlier JSONL-backed implementation are not imported automatically.
 
 ## Capabilities
 
@@ -79,7 +81,7 @@ Store credentials in Wrangler secrets rather than in checked-in files. For examp
 
 Deploy with `npx wrangler deploy`. The HTTP API does not add authentication; protect the Worker before exposing it publicly.
 
-The repository's `.npmrc` allows fresh package releases and skips the incompatible peer check between Agents' experimental Pi harness and Pi Durable 1.0. These settings apply only in this repository.
+The repository's `.npmrc` allows fresh package releases. This setting applies only in this repository.
 
 ## HTTP API
 

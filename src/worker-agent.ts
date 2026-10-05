@@ -4,20 +4,17 @@ import { WorkerShellBackend } from "@cloudflare/computer/backends/worker-shell";
 import { createAITools } from "@cloudflare/computer/tools";
 import { DynamicWorkerExecutor } from "@cloudflare/codemode";
 import { createCodeTool } from "@cloudflare/codemode/ai";
-import { BACKGROUND_CONTEXT, withAbortSignal } from "@earendil-works/chord/context";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { Type } from "@earendil-works/pi-ai";
-import { configure, createRegistry, defineExtension, defineTool, Harness, section, type Conversation, type EntryRecord, type ToolRegistration } from "@earendil-works/pi-durable";
-import { JsonlStorage } from "@earendil-works/pi-durable/storage/jsonl";
+import { configure, createRegistry, defineExtension, defineTool, Harness, section, type EntryRecord, type ToolRegistration } from "@earendil-works/pi-durable";
 import { Agent as DurableAgent, type AgentContext } from "agents";
-import { LifecycleCapability, type LifecycleJobContext, type LifecycleJobOutcome } from "agents/lifecycle";
+import { PiHarness, type PiHarnessContext } from "agents/harness/pi";
 import { createBrowserTools } from "agents/browser/ai";
-import { CLOUDFLARE_PROVIDER_ID, createAI } from "agents/models/pi-ai";
+import { createAI } from "agents/models/pi-ai";
 import { tool } from "ai";
 import { Effect } from "effect";
 import { z } from "zod";
 import { withCloudflareSpan, withObservability } from "./observability";
-import { DurableObjectFiles } from "./durable-files";
 import type { AgentStatus, Env } from "./types";
 
 const DEFAULT_MODEL = "@cf/zai-org/glm-4.7-flash";
@@ -31,11 +28,8 @@ type AiTool = {
 	execute?: (args: Record<string, unknown>, options: { toolCallId: string; messages: [] }) => Promise<unknown>;
 };
 
-type PiRuntime = { harness: Harness; root: Conversation };
-
 export class PiAgent extends DurableAgent<Env> {
 	private mcpServersAdded = false;
-	private runtime: Promise<PiRuntime> | undefined;
 	readonly ai = createAI({ binding: this.env.AI });
 	readonly registry = createRegistry();
 	readonly workspace = new Workspace({
@@ -52,11 +46,15 @@ export class PiAgent extends DurableAgent<Env> {
 			}),
 		],
 	});
-	readonly piLifecycle = new PiDurableLifecycle(this);
+	readonly piHarness: PiHarness;
 
 	constructor(ctx: AgentContext, env: Env) {
 		super(ctx, env);
-		this.lifecycle.use(this.piLifecycle);
+		this.piHarness = new PiHarness({
+			harness: (context) => this.createRuntime(context),
+			defaults: { model: this.ai(this.env.MODEL_ID ?? DEFAULT_MODEL) },
+		});
+		this.lifecycle.use(this.piHarness);
 	}
 
 	async onStart(): Promise<void> {
@@ -76,14 +74,11 @@ export class PiAgent extends DurableAgent<Env> {
 	async run(prompt: string): Promise<{ text: string }> {
 		const program = Effect.tryPromise({
 			try: async () => {
-				await this.saveStatus({ status: "running" });
 				const operationId = crypto.randomUUID();
-				const runtime = await this.openRuntime();
-				const submission = await runtime.root.submit({ type: "input", content: prompt, requestId: operationId }, BACKGROUND_CONTEXT);
 				await this.saveStatus({ status: "running", operationId });
-				const settled = await submission.wait(BACKGROUND_CONTEXT);
-				if (settled.status !== "done") throw new Error(settled.reason ?? "Pi Durable conversation did not complete");
-				const text = settled.type === "input" ? await readAssistantText(runtime.root, settled.answer) : "";
+				const result = await this.piHarness.prompt(prompt, { operationId });
+				if (result.status !== "done") throw new Error(result.reason ?? "Pi Durable conversation did not complete");
+				const text = result.text ?? "";
 				await this.saveSandbox();
 				await this.saveStatus({ status: "complete", lastResponse: text });
 				return { text };
@@ -109,35 +104,18 @@ export class PiAgent extends DurableAgent<Env> {
 	async launch(prompt: string): Promise<{ operationId: string }> {
 		return withCloudflareSpan("agent.launch", { "agent.id": this.name }, async () => {
 			const operationId = crypto.randomUUID();
-			await this.piLifecycle.wake();
-			const runtime = await this.openRuntime();
-			await runtime.root.submit({ type: "input", content: prompt, requestId: operationId }, BACKGROUND_CONTEXT);
 			await this.saveStatus({ status: "running", operationId });
-			await this.piLifecycle.wake();
+			try {
+				await this.piHarness.submit(prompt, { operationId });
+			} catch (error) {
+				await this.saveStatus({ status: "failed", lastError: error instanceof Error ? error.message : String(error) });
+				throw error;
+			}
 			return { operationId };
 		});
 	}
 
-	async resumePiWork(): Promise<boolean> {
-		const runtime = await this.openRuntime();
-		const inspection = await runtime.harness.inspect(BACKGROUND_CONTEXT);
-		return inspection.tasks.length > 0 || inspection.submissions.length > 0;
-	}
-
-	async waitForPiIdle(signal: AbortSignal): Promise<void> {
-		const runtime = await this.openRuntime();
-		await runtime.root.waitForIdle(withAbortSignal(signal, BACKGROUND_CONTEXT));
-	}
-
-	private openRuntime(): Promise<PiRuntime> {
-		this.runtime ??= this.createRuntime().catch((error: unknown) => {
-			this.runtime = undefined;
-			throw error;
-		});
-		return this.runtime;
-	}
-
-	private async createRuntime(): Promise<PiRuntime> {
+	private async createRuntime({ storage, context }: PiHarnessContext): Promise<Harness> {
 		await this.connectMcpServers();
 		await this.mcp.waitForConnections({ timeout: 10_000 });
 		const models = createModels();
@@ -217,21 +195,7 @@ export class PiAgent extends DurableAgent<Env> {
 		});
 		this.registry.install(coreExtension);
 		this.registry.install(subagentExtension);
-		const storage = await JsonlStorage.open("sessions", new DurableObjectFiles(this.ctx.storage, this.ctx.id.toString()), BACKGROUND_CONTEXT);
-		try {
-			const harness = await Harness.open(storage, { models, registry: this.registry }, BACKGROUND_CONTEXT);
-			harness.resume();
-			const root = await harness.root(BACKGROUND_CONTEXT, {
-				agent: {
-					model: { provider: CLOUDFLARE_PROVIDER_ID, modelId: this.env.MODEL_ID ?? DEFAULT_MODEL },
-					extensions: [coreExtension, subagentExtension],
-				},
-			});
-			return { harness, root };
-		} catch (error) {
-			await storage.close(BACKGROUND_CONTEXT);
-			throw error;
-		}
+		return Harness.open(storage, { models, registry: this.registry }, context);
 	}
 
 	private async runInContainer(command: string): Promise<string> {
@@ -282,15 +246,13 @@ export class PiAgent extends DurableAgent<Env> {
 			agentId: this.name, status: "idle", updatedAt: new Date(0).toISOString(),
 		};
 		if (status.status !== "running" || !status.operationId) return status;
-		await this.piLifecycle.wake();
-		const runtime = await this.openRuntime();
-		const submission = await runtime.root.commit((tx) => tx.submissionByRequest(runtime.root.id, status.operationId!), BACKGROUND_CONTEXT);
-		if (!submission || submission.status === "queued" || submission.status === "placed") return status;
-		if (submission.status === "done") {
-			const text = submission.type === "input" ? await readAssistantText(runtime.root, submission.answer) : "";
-			await this.saveStatus({ status: "complete", operationId: status.operationId, lastResponse: text });
+		const pending = await this.piHarness.pending();
+		if (pending.some((operation) => operation.operationId === status.operationId)) return status;
+		const result = await this.piHarness.wait(status.operationId);
+		if (result.status === "done") {
+			await this.saveStatus({ status: "complete", lastResponse: result.text ?? "" });
 		} else {
-			await this.saveStatus({ status: "failed", operationId: status.operationId, lastError: submission.reason });
+			await this.saveStatus({ status: "failed", lastError: result.reason ?? "Pi Durable conversation did not complete" });
 		}
 		return (await this.ctx.storage.get<AgentStatus>("agent:status")) ?? status;
 	}
@@ -300,9 +262,9 @@ export class PiAgent extends DurableAgent<Env> {
 		const status: AgentStatus = {
 			agentId: this.name, status: update.status,
 			updatedAt: new Date().toISOString(),
-			...(update.lastError ? { lastError: update.lastError } : {}),
-			...(update.lastResponse ? { lastResponse: update.lastResponse } : {}),
-			...(update.operationId ? { operationId: update.operationId } : {}),
+			...(update.lastError !== undefined ? { lastError: update.lastError } : {}),
+			...(update.lastResponse !== undefined ? { lastResponse: update.lastResponse } : {}),
+			...((update.operationId ?? previous?.operationId) ? { operationId: update.operationId ?? previous?.operationId } : {}),
 		};
 		if (update.status === "running") status.lastResponse = previous?.lastResponse;
 		await this.ctx.storage.put("agent:status", status);
@@ -310,55 +272,10 @@ export class PiAgent extends DurableAgent<Env> {
 	}
 }
 
-async function readAssistantText(conversation: Conversation, entryId: Parameters<Conversation["entries"]>[0]["minEntryId"]): Promise<string> {
-	const page = await conversation.entries({ minEntryId: entryId, maxEntryId: entryId }, 1, undefined, BACKGROUND_CONTEXT);
-	return assistantEntryText(page.items[0]);
-}
-
 function assistantEntryText(entry: EntryRecord | undefined): string {
 	const message = entry?.model?.[0];
 	if (message?.role !== "assistant") return "";
 	return message.content.map((part) => part.type === "text" ? part.text : "").join("");
-}
-
-class PiDurableLifecycle extends LifecycleCapability {
-	private readonly agent: PiAgent;
-	private waiting = false;
-
-	constructor(agent: PiAgent) {
-		super("pi-durable-runtime");
-		this.agent = agent;
-	}
-
-	async onStart(): Promise<void> {
-		if (await this.agent.resumePiWork()) await this.wake();
-	}
-
-	async onJob(context: LifecycleJobContext): Promise<LifecycleJobOutcome> {
-		if (context.job.fn !== "pi-durable-wake") return undefined;
-		if (this.waiting) return { rescheduleAt: Date.now() + 30_000 };
-		if (!(await this.agent.resumePiWork())) return undefined;
-		this.waiting = true;
-		const controller = new AbortController();
-		const timer = setTimeout(() => controller.abort(), 10 * 60_000);
-		const work = this.agent.waitForPiIdle(controller.signal).catch((error: unknown) => {
-			if (!controller.signal.aborted) {
-				this.lifecycle.events.emit("pi_durable:wake_error", { error: error instanceof Error ? error.message : String(error) });
-			}
-		}).finally(() => {
-			clearTimeout(timer);
-			this.waiting = false;
-			void this.wake().catch((error: unknown) => {
-				this.lifecycle.events.emit("pi_durable:wake_error", { error: error instanceof Error ? error.message : String(error) });
-			});
-		});
-		this.lifecycle.trackAlarmWork(work);
-		return { rescheduleAt: Date.now() + 30_000 };
-	}
-
-	wake(): Promise<unknown> {
-		return this.lifecycle.jobs.push({ id: "pi-durable-root", fn: "pi-durable-wake", time: Date.now(), singleflight: true, recoveryLoop: true });
-	}
 }
 
 function parseMcpServers(value: string | undefined): Array<{ name: string; url: string; headers?: Record<string, string> }> {
