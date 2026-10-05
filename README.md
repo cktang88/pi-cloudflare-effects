@@ -94,12 +94,12 @@ The home page is a hands-on view of one agent run:
 1. Launch the warehouse task. The agent writes a restock plan through its workspace tools.
 2. Watch the live event log and final response. Events are also saved with the agent and replayed when its WebSocket reconnects.
 3. Disconnect and reconnect the log socket while the durable task runs. The submitted PiHarness operation is separate from that viewer connection.
-4. Arm a five-second durable deadline or trigger it immediately to abort the active Pi operation and inspect its terminal status.
-5. Inject an OOM-like failure to exercise error reporting. This uses PiHarness abort; it does **not** cause a real Worker memory limit or process crash.
+4. Arm a five-second durable deadline or trigger it immediately. This calls `PiHarness.abort()` and ends the active operation.
+5. Restart the Durable Object while the operation is pending. Pi Durable reopens its stored transcript and tasks, then continues the same operation. Use **Resume run** to reconnect to that operation; it does not submit the prompt again.
 
-The **Brain** view shows the active Pi model, session tree, pending submissions, usage, and recent transcript. The **Hands** view shows registered tools, their configured replay policies, and current tool calls. Replay labels describe the tool policy; they do not predict which individual call is queued to replay. The views refresh while the log socket is connected. These inspection routes and the demo WebSocket work only from `localhost`; they do not expose transcript or tool state from a deployed Worker.
+The **Brain** view shows the active Pi model, session tree, live durable task graph, pending submissions, usage, compactions, recent transcript, and the saved trajectory when the viewer reconnects. The **Hands** view shows registered tools and replay policies, completed and active calls, up to 100 durable workspace paths, attached Artifacts repositories, configured MCP endpoints, Browser session targets and recent executions, and the Linux Container's snapshot state. Computer's Pi adapter exposes direct read-only workspace tools; Code Mode retains the multi-tool workspace, Browser, web-search, and MCP workflow. Replay labels describe each tool's configured policy; they do not predict which individual call is queued to replay. These inspection routes and the demo WebSocket work only from `localhost`; they do not expose transcript or tool state from a deployed Worker.
 
-Cloudflare can terminate a Worker before application code records a true out-of-memory failure. To observe real restarts, keep a run active, restart `wrangler dev`, and reopen the page; the page remembers the agent ID locally and reconnects to the same persisted local Durable Object.
+The restart experiment uses `DurableObjectState.abort()` to force an abrupt Durable Object restart; it does not allocate memory until an OOM occurs. If local Wrangler does not implement this API, set `config.dev` to `false` in `package.json` and run `npm run dev` to use Wrangler's remote preview. Pi Durable saves its conversation and task state in Durable Object storage. The model does not preserve hidden activations, so it may need another model call to continue from the saved point. Container files restore from the latest completed container snapshot; an interrupted command may need to be run again.
 
 The demo stores up to 300 structured events per agent. Wrangler logs and traces remain enabled for request-level details.
 
@@ -124,7 +124,8 @@ The `202` response includes an `agentId` and `operationId`. The launch continues
 | `GET /agents/:id/inspect` (localhost only) | Inspect Pi Durable session state and tool registrations |
 | `POST /agents/:id/run` with `{"prompt":"..."}` | Send a prompt to that agent and wait for its response |
 | `POST /agents/:id/interrupt` with `{"cause":"deadline"}` (localhost only) | Abort the active PiHarness operation |
-| `POST /agents/:id/interrupt` with `{"cause":"resource-limit"}` (localhost only) | Inject a labeled OOM-like failure and abort the active operation |
+| `POST /agents/:id/interrupt` with `{"cause":"runtime-crash"}` (localhost only) | Force a Durable Object restart and let Pi Durable recover its pending operation |
+| `POST /agents/:id/resume` (localhost only) | Reopen the Pi Durable session and reconnect to existing pending work without resubmitting a prompt |
 | `POST /agents/:id/deadline` with `{"seconds":5}` (localhost only) | Schedule a durable deadline for the active operation |
 | WebSocket `/agents/pi-agent/:id` (localhost only) | Receive saved events and live lifecycle events |
 

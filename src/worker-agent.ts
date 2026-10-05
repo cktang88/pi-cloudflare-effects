@@ -2,14 +2,16 @@ import { Workspace } from "@cloudflare/computer";
 import { createGitClient } from "@cloudflare/computer/git";
 import { WorkerShellBackend } from "@cloudflare/computer/backends/worker-shell";
 import { createAITools } from "@cloudflare/computer/tools";
+import { createPiTools } from "@cloudflare/computer/tools/pi-ai";
 import { DynamicWorkerExecutor } from "@cloudflare/codemode";
 import { createCodeTool } from "@cloudflare/codemode/ai";
 import { createModels } from "@earendil-works/pi-ai/models";
+import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { Type } from "@earendil-works/pi-ai";
-import { configure, createRegistry, defineExtension, defineTool, Harness, section, type EntryRecord, type ToolRegistration } from "@earendil-works/pi-durable";
+import { configure, createRegistry, defineExtension, defineTool, Harness, section, type EntryRecord, type SnapshotEvent, type ToolRegistration } from "@earendil-works/pi-durable";
 import { Agent as DurableAgent, type AgentContext, type Connection } from "agents";
 import { PiHarness, type PiHarnessContext } from "agents/harness/pi";
-import { createBrowserTools } from "agents/browser/ai";
+import { createBrowserRuntime } from "agents/browser/ai";
 import { createAI } from "agents/models/pi-ai";
 import { tool } from "ai";
 import { Effect } from "effect";
@@ -31,6 +33,8 @@ type AiTool = {
 export class PiAgent extends DurableAgent<Env> {
 	private mcpServersAdded = false;
 	private nestedToolGroups: AgentInspection["hands"]["nestedTools"] = [];
+	private browserRuntime?: ReturnType<typeof createBrowserRuntime>;
+	private trajectoryStreams = new Map<string, { stop: () => Promise<unknown> }>();
 	readonly ai = createAI({ binding: this.env.AI });
 	readonly registry = createRegistry();
 	readonly workspace = new Workspace({
@@ -59,14 +63,41 @@ export class PiAgent extends DurableAgent<Env> {
 	}
 
 	async onStart(): Promise<void> {
-		if (!(await this.ctx.storage.get<AgentStatus>("agent:status"))) {
+		const previousBootId = await this.ctx.storage.get<string>("agent:boot-id");
+		await this.ctx.storage.put("agent:boot-id", crypto.randomUUID());
+		const status = await this.ctx.storage.get<AgentStatus>("agent:status");
+		if (!status) {
 			await this.saveStatus({ status: "idle" });
+			return;
+		}
+		if (previousBootId && status.status === "running" && status.operationId) {
+			const pending = await this.piHarness.pending();
+			if (pending.some((operation) => operation.operationId === status.operationId)) {
+				await this.recordEvent("agent.runtime.recovered", {
+					previousBootId,
+					bootId: await this.ctx.storage.get<string>("agent:boot-id") ?? "unknown",
+					mechanism: "Pi Durable restored persisted session tasks",
+				}, "info", status.operationId);
+			}
 		}
 	}
 
 	async onConnect(connection: Connection): Promise<void> {
 		for (const event of await this.getEvents()) connection.send(JSON.stringify(event));
 		await this.recordEvent("client.connected", { connectionId: connection.id });
+		const stream = await this.piHarness.session().events();
+		const snapshot = compactTrajectorySnapshot(stream.snapshot);
+		connection.send(JSON.stringify({ type: "pi.trajectory", events: [snapshot] }));
+		stream.start(async (events) => {
+			try {
+				connection.send(JSON.stringify({ type: "pi.trajectory", events: events.map((event) => event.type === "snapshot" ? compactTrajectorySnapshot(event) : event) }));
+			} catch (error) {
+				await this.recordEvent("agent.trajectory.stream.error", {
+					message: error instanceof Error ? error.message : String(error),
+				}, "warn");
+			}
+		});
+		this.trajectoryStreams.set(connection.id, { stop: () => stream.stop() });
 	}
 
 	async onMessage(connection: Connection, message: string | ArrayBuffer): Promise<void> {
@@ -74,6 +105,9 @@ export class PiAgent extends DurableAgent<Env> {
 	}
 
 	async onClose(connection: Connection, code: number, reason: string, wasClean: boolean): Promise<void> {
+		const stream = this.trajectoryStreams.get(connection.id);
+		this.trajectoryStreams.delete(connection.id);
+		if (stream) await stream.stop();
 		await this.recordEvent("client.disconnected", {
 			connectionId: connection.id,
 			code,
@@ -83,6 +117,12 @@ export class PiAgent extends DurableAgent<Env> {
 	}
 
 	async onError(connectionOrError: Connection | unknown, error?: unknown): Promise<void> {
+		if (typeof connectionOrError === "object" && connectionOrError !== null && "id" in connectionOrError) {
+			const connection = connectionOrError as Connection;
+			const stream = this.trajectoryStreams.get(connection.id);
+			this.trajectoryStreams.delete(connection.id);
+			if (stream) await stream.stop();
+		}
 		const cause = error ?? connectionOrError;
 		await this.recordEvent("agent.websocket.error", {
 			message: cause instanceof Error ? cause.message : String(cause),
@@ -150,7 +190,8 @@ export class PiAgent extends DurableAgent<Env> {
 			defaultBackend: "shell",
 			backends: { shell: { description: "Persistent workspace files and Artifacts Git repositories." } },
 		} });
-		const browserTools = createBrowserTools({ ctx: this.ctx, browser: this.env.BROWSER, loader: this.env.LOADER, session: { mode: "dynamic" } });
+		this.browserRuntime = createBrowserRuntime({ ctx: this.ctx, browser: this.env.BROWSER, loader: this.env.LOADER, session: { mode: "dynamic" } });
+		const browserTools = this.browserRuntime.tools;
 		const mcpTools = this.mcp.getAITools();
 		const webSearch = tool({
 			description: "Search the live web for current facts and sources.",
@@ -175,7 +216,9 @@ export class PiAgent extends DurableAgent<Env> {
 			],
 			executor: new DynamicWorkerExecutor({ loader: this.env.LOADER }),
 		});
+		const directWorkspace = createPiTools({ workspace: this.workspace, readonly: true });
 		const tools: ToolRegistration[] = [
+			...toPiWorkspaceTools(directWorkspace),
 			...toPiTools({ code_mode: codeMode }),
 			{
 				name: "generate_image",
@@ -294,16 +337,58 @@ export class PiAgent extends DurableAgent<Env> {
 		return (await this.ctx.storage.get<AgentEvent[]>("agent:events")) ?? [];
 	}
 
+	async getRuntimeBootId(): Promise<string | undefined> {
+		return this.ctx.storage.get<string>("agent:boot-id");
+	}
+
+	async resumeDemoRun(): Promise<{ resumed: boolean; operationId?: string; status: AgentStatus["status"]; bootId?: string }> {
+		const status = await this.getStatus();
+		if (status.status !== "running" || !status.operationId) {
+			await this.recordEvent("agent.runtime.nothing_to_resume", { status: status.status }, "info", status.operationId);
+			return { resumed: false, status: status.status, ...(status.operationId ? { operationId: status.operationId } : {}), bootId: await this.getRuntimeBootId() };
+		}
+		const pending = await this.piHarness.pending();
+		if (!pending.some((operation) => operation.operationId === status.operationId)) {
+			const settled = await this.getStatus();
+			await this.recordEvent("agent.runtime.nothing_to_resume", { status: settled.status }, "info", status.operationId);
+			return { resumed: false, status: settled.status, operationId: status.operationId, bootId: await this.getRuntimeBootId() };
+		}
+		await this.recordEvent("agent.runtime.resume_requested", {
+			mechanism: "Pi Durable pending operation; prompt was not resubmitted",
+		}, "info", status.operationId);
+		return { resumed: true, status: "running", operationId: status.operationId, bootId: await this.getRuntimeBootId() };
+	}
+
 	async inspectBrainAndHands(): Promise<AgentInspection> {
 		const session = this.piHarness.session();
 		const eventStream = await session.events();
 		const snapshot = eventStream.snapshot;
 		await eventStream.stop();
-		const [entries, pending, sessions] = await Promise.all([
+		const pi = await this.piHarness.pi();
+		const taskGraph = await pi.taskGraph(BACKGROUND_CONTEXT);
+		const tasks = Object.values(taskGraph.value.tasks).map(({ id, kind, conversationId, owner, state, background, abortRequested }) => ({
+			id: String(id),
+			kind,
+			conversationId: String(conversationId),
+			...(owner ? { owner: String(owner) } : {}),
+			status: state.status,
+			phase: "phase" in state ? state.phase : state.outcome,
+			background,
+			abortRequested,
+		}));
+		taskGraph.dispose();
+		const inspectionErrors: string[] = [];
+		const [entries, pending, sessions, workspaceFiles, artifactRepos, browserExecutions, browserSession] = await Promise.all([
 			session.messages(),
 			this.piHarness.pending(),
 			this.piHarness.sessions.list(),
+			this.workspace.fs.find("/", undefined, { limit: 100 }),
+			this.workspace.artifacts.list().catch((error: unknown) => { inspectionErrors.push(`Artifacts: ${errorMessage(error)}`); return []; }),
+			(this.browserRuntime?.runtime.executions(10) ?? Promise.resolve([])).catch((error: unknown) => { inspectionErrors.push(`Browser executions: ${errorMessage(error)}`); return []; }),
+			(this.browserRuntime?.connector.sessionInfo() ?? Promise.resolve(undefined)).catch((error: unknown) => { inspectionErrors.push(`Browser session: ${errorMessage(error)}`); return undefined; }),
 		]);
+		const sandboxSnapshot = await this.ctx.storage.get<ContainerSnapshot>("sandbox:snapshot");
+		const snapshotMetadata = sandboxSnapshot as unknown as { name?: unknown; size?: unknown } | undefined;
 		const registry = this.registry.snapshot();
 		const extensionChoice = snapshot.agent.extensions;
 		const defaultExtensions = registry.installed().map((extension) => extension.name);
@@ -330,6 +415,7 @@ export class PiAgent extends DurableAgent<Env> {
 				instructions: SYSTEM_PROMPT,
 				usage: snapshot.usage,
 				sessions,
+				tasks,
 				pending,
 				transcript: entries.slice(-30).map((entry) => ({
 					id: String(entry.id),
@@ -343,6 +429,7 @@ export class PiAgent extends DurableAgent<Env> {
 						...(snapshot.generation.deferred ? { deferred: snapshot.generation.deferred } : {}),
 					} : null,
 					inbox: snapshot.inbox,
+					compactions: snapshot.compactions,
 				},
 			},
 			hands: {
@@ -354,6 +441,24 @@ export class PiAgent extends DurableAgent<Env> {
 					...(slot.output ? { output: slot.output.slice(-2_000) } : {}),
 					...(slot.diagnostics?.length ? { diagnostics: slot.diagnostics } : {}),
 				})),
+				recentTools: inspectRecentTools(entries),
+				workspaceFiles,
+				artifactRepos: artifactRepos.map(({ name, description }) => ({ name, ...(description ? { description } : {}) })),
+				mcpServers: this.mcp.listServers().map(({ id, name, server_url }) => ({ id, name, endpoint: safeMcpEndpoint(server_url) })),
+				inspectionErrors,
+				browser: {
+					executions: browserExecutions.map(({ id, status, code, error }) => ({ id, status, code: code.slice(0, 1_200), ...(error ? { error } : {}) })),
+					session: browserSession ? {
+						sessionId: browserSession.sessionId,
+						targets: (browserSession.targets ?? []).slice(0, 10).map(({ id, type, url, title }) => ({ id, ...(type ? { type } : {}), ...(url ? { url } : {}), ...(title ? { title } : {}) })),
+					} : null,
+				},
+				sandbox: {
+					containerRunning: Boolean(this.ctx.container?.running),
+					snapshotAvailable: Boolean(sandboxSnapshot),
+					...(typeof snapshotMetadata?.name === "string" ? { snapshotName: snapshotMetadata.name } : {}),
+					...(typeof snapshotMetadata?.size === "number" ? { snapshotSize: snapshotMetadata.size } : {}),
+				},
 			},
 		};
 	}
@@ -363,8 +468,12 @@ export class PiAgent extends DurableAgent<Env> {
 		if (status.status !== "running" || !status.operationId) return { interrupted: false };
 		const details: Record<string, string | number | boolean> = cause === "deadline"
 			? { source: "demo deadline control", action: "PiHarness.abort" }
-			: { source: "demo fault injection", action: "PiHarness.abort", simulation: "resource limit only; no real Worker OOM" };
-		await this.recordEvent(cause === "deadline" ? "demo.deadline.fired" : "demo.resource_limit.injected", details, "warn", status.operationId);
+			: { source: "demo fault injection", action: "Durable Object context abort", simulation: "abrupt object restart; no real Worker OOM" };
+		await this.recordEvent(cause === "deadline" ? "demo.deadline.fired" : "demo.runtime.restart_requested", details, "warn", status.operationId);
+		if (cause === "runtime-crash") {
+			this.ctx.abort("Demo: simulate abrupt Durable Object restart", { retryAlarm: true });
+			return { interrupted: true, operationId: status.operationId };
+		}
 		const interrupted = await this.piHarness.abort({ operationId: status.operationId });
 		return { interrupted, operationId: status.operationId };
 	}
@@ -460,6 +569,61 @@ function inspectMessage(message: EntryRecord["model"] extends readonly (infer Me
 	return { role: value.role ?? "unknown", content };
 }
 
+function compactTrajectorySnapshot(snapshot: SnapshotEvent) {
+	return {
+		type: "snapshot" as const,
+		generation: snapshot.generation,
+		history: snapshot.entries.slice(-30).map((entry) => ({
+			id: String(entry.id),
+			kind: entry.kind,
+			messages: (entry.model ?? []).map(inspectMessage),
+		})),
+		tools: snapshot.tools.map(({ name, status, output }) => ({ name, status, ...(output ? { output: output.slice(-1_000) } : {}) })),
+		compactions: snapshot.compactions.slice(-5),
+		inbox: snapshot.inbox.slice(-10),
+		usage: snapshot.usage,
+	};
+}
+
+function inspectRecentTools(entries: readonly EntryRecord[]): AgentInspection["hands"]["recentTools"] {
+	const results = new Map<string, { result?: string; isError?: boolean }>();
+	const calls: Array<{ id?: string; item: AgentInspection["hands"]["recentTools"][number] }> = [];
+	for (const entry of entries) {
+		for (const message of entry.model ?? []) {
+			const value = message as unknown as { role?: string; toolCallId?: string; content?: unknown; isError?: boolean };
+			const parts = Array.isArray(value.content) ? value.content : [];
+			if (value.role === "tool" && typeof value.toolCallId === "string") {
+				const result = parts.flatMap((block) => block && typeof block === "object" && "text" in block && typeof block.text === "string" ? [block.text] : []).join("\n");
+				results.set(value.toolCallId, { result: result.slice(0, 1_000), isError: value.isError === true });
+			}
+			for (const item of parts) {
+				if (!item || typeof item !== "object") continue;
+				const part = item as Record<string, unknown>;
+				if (part.type === "toolCall" && typeof part.name === "string") {
+					calls.push({
+						id: typeof part.id === "string" ? part.id : undefined,
+						item: { name: part.name, ...(part.arguments === undefined ? {} : { arguments: JSON.stringify(part.arguments).slice(0, 800) }) },
+					});
+				}
+			}
+		}
+	}
+	return calls.slice(-12).map(({ id, item }) => ({ ...item, ...(id && results.has(id) ? results.get(id) : {}) }));
+}
+
+function toPiWorkspaceTools(computer: ReturnType<typeof createPiTools>): ToolRegistration[] {
+	return computer.tools.map((tool) => ({
+		name: tool.name,
+		description: tool.description,
+		parameters: Type.Unsafe<Record<string, unknown>>(tool.parameters),
+		replay: "safe",
+		execute: async (args) => {
+			const result = await traceTool(tool.name, () => computer.execute({ id: crypto.randomUUID(), name: tool.name, arguments: args }));
+			return { content: result.content, isError: result.isError };
+		},
+	}));
+}
+
 function describeToolSet(group: string, tools: object): AgentInspection["hands"]["nestedTools"] {
 	return Object.entries(tools as Record<string, { description?: unknown }>).map(([name, definition]) => {
 		const description = typeof definition.description === "string"
@@ -484,6 +648,19 @@ function parseMcpServers(value: string | undefined): Array<{ name: string; url: 
 		}
 		return { name: server.name, url: server.url, ...(server.headers ? { headers: server.headers as Record<string, string> } : {}) };
 	});
+}
+
+function safeMcpEndpoint(value: string): string {
+	try {
+		const endpoint = new URL(value);
+		return endpoint.origin;
+	} catch {
+		return "configured endpoint";
+	}
+}
+
+function errorMessage(error: unknown): string {
+	return (error instanceof Error ? error.message : String(error)).slice(0, 240);
 }
 
 function toPiTools(toolSet: Record<string, unknown>): ToolRegistration[] {

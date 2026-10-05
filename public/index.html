@@ -13,8 +13,8 @@
     <header class="masthead">
       <div>
         <div class="eyebrow"><span class="brand-mark" aria-hidden="true">P·D</span> Pi Durable / Field Recorder</div>
-        <h1>See the run.<br>Understand the failure.</h1>
-        <p class="intro">A working instrument for watching an agent think, act, disconnect, and recover. The event rail stays in view while you inspect its brain and hands.</p>
+        <h1>Watch an agent work.</h1>
+        <p class="intro">Follow the run live. Open details only when you need them.</p>
       </div>
       <span class="local">Local instrument · private to this machine</span>
     </header>
@@ -52,18 +52,19 @@
               </div>
               <span class="trace-key"><i aria-hidden="true"></i> newest at bottom</span>
             </div>
+            <details class="filter-drawer"><summary><span aria-hidden="true">⌕</span> Filters <span id="event-count" class="event-count" role="status" aria-live="polite">0 events</span></summary>
             <div class="event-controls" role="group" aria-label="Filter run trace">
               <label for="event-search">Find in trace<input id="event-search" type="search" placeholder="Event, tool, operation…" autocomplete="off"></label>
               <label for="event-level">Severity<select id="event-level"><option value="">All levels</option><option value="info">Info</option><option value="warn">Warning</option><option value="error">Error</option></select></label>
               <button id="reset-event-filters" type="button">Reset filters</button>
-              <span id="event-count" class="event-count" role="status" aria-live="polite">0 events</span>
             </div>
+            </details>
             <div id="events" class="events event-rail" aria-live="polite" aria-relevant="additions">
               <div class="empty"><strong>Awaiting a run</strong><span>Launch the sample task to watch submissions, tool calls, status changes, and reconnect replay arrive in order.</span></div>
             </div>
             <div class="answer">
               <div class="answer-top">
-                <span class="answer-title">Run result</span>
+                <span id="answer-title" class="answer-title">Run result</span>
                 <span class="model-indicator">Model <strong id="model-name">GLM 5.3 Flash · Workers AI</strong></span>
               </div>
               <pre id="answer">The final response will be kept with this run.</pre>
@@ -80,21 +81,30 @@
               <button id="tab-hands" class="tab" data-tab="hands" role="tab" aria-selected="false" aria-controls="view-hands" tabindex="-1">Hands</button>
             </div>
             <section id="view-brain" role="tabpanel" aria-labelledby="tab-brain" tabindex="0">
-              <div id="brain-summary" class="state-grid"><div class="empty">Start a run to read its model, sessions, pending work, generation, and inbox.</div></div>
+              <div id="brain-summary" class="state-grid"><div class="empty">Start a run to inspect the live agent.</div></div>
               <details class="instructions"><summary>Base agent instructions</summary><pre id="instructions">Instructions appear when a run is selected.</pre></details>
-              <div class="event-head"><div><span class="section-kicker">Conversation record</span><h3>Recent transcript</h3></div></div>
-              <div id="transcript" class="list"><div class="empty">No transcript entries yet.</div></div>
-              <p class="privacy-note">Thinking blocks are omitted. Transcript and tool details are available only through this localhost inspector.</p>
+              <details class="inspect-group" id="task-group"><summary><span class="group-icon" aria-hidden="true">◉</span><span>Live tasks</span><span id="task-count" class="group-count">0</span></summary><div id="durable-tasks" class="list"><div class="empty">No live durable tasks.</div></div></details>
+              <details class="inspect-group"><summary><span class="group-icon" aria-hidden="true">▤</span><span>Conversation transcript</span><span id="transcript-count" class="group-count">0</span></summary><div id="transcript" class="list"><div class="empty">No transcript entries yet.</div></div><p class="privacy-note">Thinking blocks are omitted. Transcript and tool details stay in this local inspector.</p></details>
+              <details class="inspect-group"><summary><span class="group-icon" aria-hidden="true">⌘</span><span>Runtime details</span></summary><div id="brain-extra" class="state-grid"></div></details>
             </section>
             <section id="view-hands" role="tabpanel" aria-labelledby="tab-hands" tabindex="0" hidden>
-              <div class="event-head"><div><span class="section-kicker">Registered with Pi Durable</span><h3>Loaded tools</h3></div></div>
-              <p class="hint">Replay shows each tool’s configured policy. It does not predict whether a specific call will replay.</p>
-              <div id="tools" class="list"><div class="empty">Loaded tool registrations appear here.</div></div>
-              <div class="event-head"><div><span class="section-kicker">Inside Code Mode</span><h3>Nested tools</h3></div></div>
-              <p class="hint">These namespaced tools run inside one top-level <code>code_mode</code> operation.</p>
-              <div id="nested-tools" class="list"><div class="empty">Nested tools appear here.</div></div>
-              <div class="event-head"><div><span class="section-kicker">Right now</span><h3>Current calls</h3></div></div>
-              <div id="calls" class="list"><div class="empty">No active tool calls.</div></div>
+              <div id="inspection-errors" class="list"></div>
+              <div id="hands-summary" class="state-grid"></div>
+              <details class="inspect-group"><summary><span class="group-icon" aria-hidden="true">▣</span><span>Workspace files</span><span id="workspace-count" class="group-count">0</span></summary><div id="workspace-files" class="list"><div class="empty">Workspace files appear after inspection.</div></div></details>
+              <details class="inspect-group"><summary><span class="group-icon" aria-hidden="true">⚒</span><span>Active calls</span><span id="calls-count" class="group-count">0</span></summary><div id="calls" class="list"><div class="empty">No active tool calls.</div></div></details>
+              <details class="inspect-group"><summary><span class="group-icon" aria-hidden="true">↻</span><span>Recent tool calls</span><span id="recent-tools-count" class="group-count">0</span></summary><div id="recent-tools" class="list"><div class="empty">Completed calls appear after the first turn.</div></div></details>
+              <details class="inspect-group"><summary><span class="group-icon" aria-hidden="true">⌘</span><span>Tool catalog</span><span id="tool-count" class="group-count">0</span></summary><div class="event-head"><div><span class="section-kicker">Registered with Pi Durable</span><h3>Loaded tools</h3></div></div><div id="tools" class="list"><div class="empty">Loaded tool registrations appear here.</div></div><div class="event-head"><div><span class="section-kicker">Inside Code Mode</span><h3>Nested tools</h3></div></div><div id="nested-tools" class="list"><div class="empty">Nested tools appear here.</div></div></details>
+              <details class="inspect-group"><summary><span class="group-icon" aria-hidden="true">◈</span><span>Browser, MCP &amp; artifacts</span></summary>
+              <div class="event-head"><div><span class="section-kicker">Cloudflare Artifacts</span><h3>Attached repositories</h3></div></div>
+              <div id="artifact-repos" class="list"><div class="empty">Artifact repositories appear after inspection.</div></div>
+              <div class="event-head"><div><span class="section-kicker">Model Context Protocol</span><h3>Configured MCP servers</h3></div></div>
+              <p class="hint">This lists saved server configuration. It does not claim the current transport is connected.</p>
+              <div id="mcp-servers" class="list"><div class="empty">MCP servers appear after inspection.</div></div>
+              <div class="event-head"><div><span class="section-kicker">Browser Rendering</span><h3>Shared session and recent runs</h3></div></div>
+              <div id="browser-state" class="state-grid"><div class="empty">Browser state appears after inspection.</div></div>
+              <div id="browser-runs" class="list"><div class="empty">Browser executions appear after inspection.</div></div>
+              </details>
+              <details class="inspect-group"><summary><span class="group-icon" aria-hidden="true">▧</span><span>Container &amp; recovery</span></summary><div class="event-head"><div><span class="section-kicker">Sandbox recovery</span><h3>Latest container snapshot</h3></div></div><div id="sandbox-state" class="state-grid"><div class="empty">Sandbox state appears after inspection.</div></div></details>
             </section>
           </section>
         </div>
@@ -102,42 +112,43 @@
 
       <aside class="runbook panel" aria-labelledby="runbook-title">
         <span class="section-kicker">00 / Runbook</span>
-        <h2 id="runbook-title">Give it useful work.</h2>
-        <p class="panel-intro">The sample task uses the agent’s workspace tools to calculate a restock and write a Markdown plan.</p>
-        <label for="prompt">Task brief</label>
-        <textarea id="prompt">You are helping a small warehouse. A shipment arrived with 8 desk lamps and 3 keyboards. Current stock is 2 desk lamps and 5 keyboards. The target stock is 6 lamps and 4 keyboards. Use the workspace tools through code_mode to write /restock-plan.md with the quantities to reorder and a short explanation. Then report the file you created and the reorder quantities.</textarea>
+        <h2 id="runbook-title">Restock plan demo</h2>
+        <p class="panel-intro">Restock a small warehouse and save the reorder plan.</p>
+        <details class="task-editor"><summary><span aria-hidden="true">✎</span> Edit task brief</summary>
+        <label for="prompt">Task instructions</label>
+        <textarea id="prompt">You are helping a small warehouse. A shipment arrived with 8 desk lamps and 3 keyboards. Current stock is 2 desk lamps and 5 keyboards. The target stock is 6 lamps and 4 keyboards. Use the workspace tools through code_mode to write /restock-plan.md with the quantities to reorder and a short explanation. Then report the file you created and the reorder quantities.</textarea></details>
         <div class="action-stack">
           <button id="launch" class="primary">Launch durable run <span aria-hidden="true">↗</span></button>
-          <button id="new-run" disabled>Start fresh run</button>
+          <button id="new-run" disabled>New agent · fresh conversation</button>
         </div>
-        <p class="hint">Launch returns when PiHarness has durably accepted the work. The run continues if you disconnect this page.</p>
+        <p class="hint">The run continues if this page disconnects.</p>
 
         <div class="rule-break"></div>
-        <span class="section-kicker">03 / Experiments</span>
-        <h3>Change one condition.</h3>
-        <p class="panel-intro">Each experiment has a visible runtime consequence. Controls unlock when the selected run is active.</p>
+        <details class="experiment-drawer"><summary><span class="section-kicker">03 / Experiments</span><strong>Simulate a failure or disconnect</strong><span aria-hidden="true">＋</span></summary>
+        <p class="panel-intro">Controls unlock while the selected run is active.</p>
 
         <article class="experiment">
           <div><span class="experiment-index">A</span><div><strong>Leave the observer</strong><p>Close only this event socket. PiHarness keeps working.</p></div></div>
-          <div class="buttons"><button id="disconnect" disabled>Disconnect viewer</button><button id="reconnect" disabled>Reconnect + replay</button></div>
+          <div class="buttons"><button id="disconnect" disabled>Disconnect viewer</button><button id="resume-run" disabled>Resume run</button></div>
         </article>
         <article class="experiment">
           <div><span class="experiment-index">B</span><div><strong>Apply a deadline</strong><p>Schedule a durable app timer that aborts the current operation in five seconds.</p></div></div>
           <div class="buttons"><button id="arm-timeout" class="warn" disabled>Arm 5-second deadline</button><button id="timeout" class="warn" disabled>Abort now</button></div>
         </article>
         <article class="experiment experiment-danger">
-          <div><span class="experiment-index">C</span><div><strong>Simulate a resource limit</strong><p>This sends PiHarness an abort and labels the event as a simulation. It does not trigger a platform OOM.</p></div></div>
-          <div class="buttons"><button id="oom" class="danger" disabled>Abort · simulate OOM</button></div>
+          <div><span class="experiment-index">C</span><div><strong>Restart the Durable Object</strong><p>Force an abrupt object restart while Pi Durable work is pending. On activation, Pi Durable reloads its saved session and resumes the operation. This does not exhaust actual Worker memory.</p></div></div>
+          <div class="buttons"><button id="crash" class="danger" disabled>Restart · resume saved work</button></div>
         </article>
+        </details>
       </aside>
     </div>
 
-    <footer class="notes" aria-label="How to read this instrument">
+    <details class="notes-drawer" aria-label="How to read this instrument"><summary><span aria-hidden="true">ⓘ</span> How recovery works</summary><footer class="notes">
       <div class="note"><strong>Durable means saved</strong>Events are kept by the agent and sent again when the viewer reconnects.</div>
       <div class="note"><strong>Deadline means abort</strong>This app-level timer calls PiHarness abort. It is not a Cloudflare execution timeout.</div>
       <div class="note"><strong>Replay is policy</strong>The Hands view shows configured tool policy; the actual replay decision depends on the operation state.</div>
-      <div class="note"><strong>OOM is simulated</strong>A real Worker memory limit may stop execution before application code can write a log.</div>
-    </footer>
+      <div class="note"><strong>Restart keeps Pi state</strong>Pi Durable stores the transcript and pending tasks in Durable Object storage. Recovery can call the model again to continue from its saved state; it cannot restore hidden model activations.</div>
+    </footer></details>
   </main>
 </body>
 </html>

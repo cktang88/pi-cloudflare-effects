@@ -51,7 +51,32 @@ export class Orchestrator extends DurableAgent<Env> {
 	async interruptDemoRun(agentId: string, cause: DemoInterrupt) {
 		const agent = await this.findAgent(agentId);
 		if (!agent) throw new Error(`Agent ${agentId} not found`);
-		return agent.interruptDemoRun(cause);
+		if (cause !== "runtime-crash") return agent.interruptDemoRun(cause);
+		const previousBootId = await agent.getRuntimeBootId();
+		let interruptionError: unknown;
+		try {
+			const result = await agent.interruptDemoRun(cause);
+			if (!result.interrupted) return result;
+		} catch (error) {
+			interruptionError = error;
+		}
+		const recovery = await agent.resumeDemoRun();
+		const events = await agent.getEvents();
+		const restartWasRequested = events.some((event) => event.type === "demo.runtime.restart_requested" && event.operationId === recovery.operationId);
+		if (restartWasRequested && recovery.operationId && recovery.bootId !== previousBootId) {
+			return { interrupted: true, resumed: recovery.resumed, operationId: recovery.operationId, status: recovery.status };
+		}
+		if (restartWasRequested && recovery.bootId === previousBootId) {
+			throw new Error("The Durable Object did not restart. Check Wrangler output; local Wrangler may not support ctx.abort. Set package.config.dev to false to run this experiment against Cloudflare.", { cause: interruptionError });
+		}
+		if (interruptionError !== undefined) throw interruptionError;
+		throw new Error("The Durable Object did not restart after the crash request.");
+	}
+
+	async resumeDemoRun(agentId: string) {
+		const agent = await this.findAgent(agentId);
+		if (!agent) throw new Error(`Agent ${agentId} not found`);
+		return agent.resumeDemoRun();
 	}
 
 	async armDemoDeadline(agentId: string, seconds: number) {

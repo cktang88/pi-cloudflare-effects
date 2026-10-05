@@ -31,10 +31,10 @@ export default {
 			return json({ agents: await orchestrator.listAgents() });
 		}
 
-		const match = /^\/agents\/([a-f0-9-]+)(?:\/(run|events|inspect|interrupt|deadline))?$/.exec(url.pathname);
+		const match = /^\/agents\/([a-f0-9-]+)(?:\/(run|events|inspect|interrupt|deadline|resume))?$/.exec(url.pathname);
 		if (!match) return json({ error: "Not found" }, 404);
 		const [, agentId, action] = match;
-		if ((action === "events" || action === "inspect" || action === "interrupt" || action === "deadline") && !isLocalDemoRequest(url.hostname)) {
+		if ((action === "events" || action === "inspect" || action === "interrupt" || action === "deadline" || action === "resume") && !isLocalDemoRequest(url.hostname)) {
 			return json({ error: "Demo inspection is available on localhost only" }, 403);
 		}
 
@@ -64,6 +64,10 @@ export default {
 				const cause = await readInterrupt(request);
 				if (cause instanceof Response) return cause;
 				return json(await orchestrator.interruptDemoRun(agentId, cause));
+			}
+
+			if (request.method === "POST" && action === "resume") {
+				return json(await orchestrator.resumeDemoRun(agentId));
 			}
 
 			if (request.method === "POST" && action === "deadline") {
@@ -103,8 +107,8 @@ async function readInterrupt(request: Request): Promise<DemoInterrupt | Response
 	} catch {
 		return json({ error: "Body must be valid JSON" }, 400);
 	}
-	if (!body || typeof body !== "object" || !("cause" in body) || (body.cause !== "deadline" && body.cause !== "resource-limit")) {
-		return json({ error: "cause must be deadline or resource-limit" }, 400);
+	if (!body || typeof body !== "object" || !("cause" in body) || (body.cause !== "deadline" && body.cause !== "runtime-crash")) {
+		return json({ error: "cause must be deadline or runtime-crash" }, 400);
 	}
 	return body.cause;
 }
