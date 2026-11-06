@@ -2,10 +2,8 @@ import { Workspace } from "@cloudflare/computer";
 import { WorkerShellBackend } from "@cloudflare/computer/backends/worker-shell";
 import { createGitClient } from "@cloudflare/computer/git";
 import { createCloudflareObserver } from "@cloudflare/computer/observe/cloudflare";
-import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
 import { createPiTools, type CreatePiToolsResult } from "@cloudflare/computer/tools/pi-ai";
-import { DynamicWorkerExecutor } from "@cloudflare/codemode";
-import { createCodeTool } from "@cloudflare/codemode/ai";
+import { CodemodeConnector, createCodemodeRuntime, DynamicWorkerExecutor, McpConnector, sanitizeToolName, type ConnectorTools, type McpConnectionLike } from "@cloudflare/codemode";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { createModels } from "@earendil-works/pi-ai/models";
 import {
@@ -18,6 +16,7 @@ import {
 	createRegistry,
 	type AgentState,
 	type ConversationView,
+	type ConversationWatch,
 	type EntryRecord,
 	type Extension,
 	type LiveState,
@@ -25,14 +24,14 @@ import {
 	type ToolRegistration,
 } from "@earendil-works/pi-durable";
 import { obj, str } from "@earendil-works/pi-schema";
-import { Agent, type AgentContext, type Connection } from "agents";
+import { Agent, type AgentContext, type Connection, type ConnectionContext } from "agents";
 import { Browser, browserRun } from "agents/browser";
 import { browserTool } from "agents/browser/pi";
 import { PiHarness, type PiHarnessContext } from "agents/harness/pi";
 import { createAI } from "agents/models/pi-ai";
-import { webFetchTool as webFetchAiTool } from "agents/webfetch/ai-sdk";
+import { fetchWeb, type WebFetchRequest } from "agents/webfetch";
 import { webFetchTool } from "agents/webfetch/pi";
-import { webSearchTool as webSearchAiTool } from "agents/websearch/ai-sdk";
+import { createAIWebSearch, MAX_WEB_SEARCH_LIMIT, type WebSearchToolInput } from "agents/websearch";
 import { webSearchTool } from "agents/websearch/pi";
 import { tracing } from "cloudflare:workers";
 import { errorMessage, traced } from "./observability";
@@ -42,7 +41,12 @@ import type { AgentEvent, AgentInspection, AgentStatus, ConversationSnapshot, De
 const DEFAULT_MODEL = "@cf/zai-org/glm-5.3-flash";
 const CORE_EXTENSION = "cloudflare-agent-tools";
 const SUBAGENT_EXTENSION = "durable-subagents";
-const SYSTEM_PROMPT = `You are a careful, resourceful agent running on Pi Durable. Your conversation, tasks, and submissions are durable and resumable. You have a persistent workspace, a resumable Linux sandbox, web search and fetch, a persistent browser, and connected MCP tools. Use code_mode to combine short multi-step workspace, web, and MCP work in one script. Keep durable facts that will help future runs in /memory.md in the workspace. Work in small verified steps, and report important actions and errors clearly.`;
+const SYSTEM_PROMPT = `You are a careful, resourceful agent running on Pi Durable. Your conversation, tasks, and submissions are durable and resumable. You have a persistent workspace (read, write, edit, delete, ls, find, grep, and exec in a shell with git and Artifacts), a resumable Linux sandbox, web search and fetch, a persistent browser, and connected MCP tools. Use code_mode to combine multi-step workspace, web, and MCP work in one script; inside it, codemode.search() and codemode.describe() find the available methods. Keep durable facts that will help future runs in /memory.md in the workspace. Work in small verified steps, and report important actions and errors clearly.`;
+/** Computer tools that can run again after an eviction cut them off (as in the Agents Pi harness example). */
+const REPLAY_SAFE_WORKSPACE_TOOLS = new Set(["read", "ls", "find", "grep", "write", "delete"]);
+const MAX_EVENTS = 300;
+/** `WebSocket.OPEN`; the constant is not defined on every runtime's global. */
+const SOCKET_OPEN = 1;
 
 const Delegate = obj({ task: str({ minLength: 1, maxLength: 8_000, description: "A self-contained task for the subagent." }) });
 const GenerateImage = obj({
@@ -50,12 +54,111 @@ const GenerateImage = obj({
 	prompt: str({ minLength: 1, maxLength: 4_000 }),
 });
 const ContainerExec = obj({ command: str({ minLength: 1, maxLength: 16_384 }) });
-const CodeMode = obj({ code: str({ minLength: 1, description: "An async arrow function that calls the workspace, web, and mcp tool groups." }) });
+const CodeMode = obj({ code: str({ minLength: 1, description: "An async arrow function. Connector methods are globals (workspace.*, web.*, and one per MCP server); codemode.search() and codemode.describe() find them." }) });
+
+/** Reads that Code Mode may re-run on replay instead of storing their (possibly large) results. */
+const WORKSPACE_READS = new Set(["read", "ls", "find", "grep"]);
+
+/**
+ * Computer's workspace tools as a Code Mode connector, over the same framework-neutral
+ * executor (`createPiTools`) the direct Pi tools use. Scripts get each tool's structured
+ * result; a failed call throws in the script with the tool's message.
+ */
+class WorkspaceConnector extends CodemodeConnector {
+	constructor(ctx: DurableObjectState, private readonly computer: CreatePiToolsResult) {
+		super(ctx as unknown as ExecutionContext, {});
+	}
+
+	name(): string {
+		return "workspace";
+	}
+
+	protected instructions(): string {
+		return "Files in the agent's durable workspace, and exec in its shell (git and Artifacts commands included).";
+	}
+
+	protected tools(): ConnectorTools {
+		return Object.fromEntries(this.computer.tools.map((tool) => [tool.name, {
+			description: tool.description,
+			inputSchema: tool.parameters as ConnectorTools[string]["inputSchema"],
+			...(WORKSPACE_READS.has(tool.name) ? { replay: "reexecute" as const } : {}),
+			execute: async (args: unknown) => {
+				const result = await this.computer.execute({ id: crypto.randomUUID(), name: tool.name, arguments: args });
+				const text = result.content.map((part) => part.type === "text" ? part.text : `[${part.mimeType} image]`).join("\n");
+				if (result.isError) throw new Error(text);
+				return result.details ?? text;
+			},
+		}]));
+	}
+}
+
+/**
+ * Web Search and Web Fetch as a Code Mode connector, on the host-side sources Agents
+ * documents for use without a model (`createAIWebSearch`, `fetchWeb`). Scripts get the
+ * full search response and the whole page; the model sees only what the script returns.
+ */
+class WebConnector extends CodemodeConnector {
+	constructor(ctx: DurableObjectState, private readonly ai: Ai, private readonly gateway: string) {
+		super(ctx as unknown as ExecutionContext, {});
+	}
+
+	name(): string {
+		return "web";
+	}
+
+	protected instructions(): string {
+		return "Search the live web, then read result URLs with fetch.";
+	}
+
+	protected tools(): ConnectorTools {
+		const search = createAIWebSearch({ binding: this.ai, gateway: this.gateway });
+		return {
+			search: {
+				description: "Search the live web. Resolves with { items: [{ url, title, description }], metadata }.",
+				inputSchema: {
+					type: "object",
+					properties: { query: { type: "string", minLength: 1 }, limit: { type: "integer", minimum: 1, maximum: MAX_WEB_SEARCH_LIMIT } },
+					required: ["query"],
+					additionalProperties: false,
+				},
+				execute: (args) => search.search(args as WebSearchToolInput),
+			},
+			fetch: {
+				description: "Read one http(s) URL. Resolves with the page: Markdown for HTML, PDFs, and documents (format \"auto\"), or the body as served (\"raw\"), with title, status, and content.",
+				inputSchema: {
+					type: "object",
+					properties: { url: { type: "string", minLength: 1 }, format: { type: "string", enum: ["auto", "raw"] } },
+					required: ["url"],
+					additionalProperties: false,
+				},
+				execute: (args) => fetchWeb(args as WebFetchRequest, { binding: this.ai }),
+			},
+		};
+	}
+}
+
+/** One configured MCP server as a Code Mode connector, over the Agent's live MCP connection. */
+class AgentMcpConnector extends McpConnector {
+	constructor(ctx: DurableObjectState, private readonly connectorName: string, private readonly connection: McpConnectionLike) {
+		super(ctx as unknown as ExecutionContext, {});
+	}
+
+	name(): string {
+		return this.connectorName;
+	}
+
+	protected instructions(): string | undefined {
+		return this.connection.instructions;
+	}
+
+	protected createConnection(): McpConnectionLike {
+		return this.connection;
+	}
+}
 
 export class PiAgent extends Agent<Env> {
-	private mcpServersAdded = false;
-	private nestedToolGroups: AgentInspection["hands"]["nestedTools"] = [];
-	private readonly trajectoryWatches = new Map<string, { stop: () => Promise<unknown> }>();
+	/** Pi's conversation watches live in memory, one per socket; `onStart` reattaches them after hibernation. */
+	private readonly viewWatches = new Map<string, ConversationWatch>();
 	readonly ai = createAI({ binding: this.env.AI });
 	/** One registry per object: Pi keeps each Harness subscribed to it until the Harness closes. */
 	readonly registry = createRegistry();
@@ -85,16 +188,27 @@ export class PiAgent extends Agent<Env> {
 		this.lifecycle.use(this.browser).use(this.piHarness);
 	}
 
+	/**
+	 * The worker shell's Dynamic Worker reaches this Workspace through the exported
+	 * `WorkspaceServiceProxy`, which calls this. `withWorkspace` would install it; this
+	 * class constructs its Workspace directly, so it exposes the stub itself.
+	 */
+	async __getWorkspaceStub() {
+		await this.workspace.ready();
+		return this.workspace.stub();
+	}
+
+	/** Host startup. Lifecycle capabilities (Browser, PiHarness) have already started, so Pi is open. */
 	async onStart(): Promise<void> {
+		this.sql`CREATE TABLE IF NOT EXISTS agent_events (seq INTEGER PRIMARY KEY AUTOINCREMENT, event TEXT NOT NULL)`;
+		await this.connectMcpServers();
 		const previousBootId = await this.ctx.storage.get<string>("agent:boot-id");
 		const bootId = crypto.randomUUID();
 		await this.ctx.storage.put("agent:boot-id", bootId);
 		const status = await this.ctx.storage.get<AgentStatus>("agent:status");
 		if (!status) {
 			await this.saveStatus({ status: "idle" });
-			return;
-		}
-		if (previousBootId && status.status === "running" && status.operationId) {
+		} else if (previousBootId && status.status === "running" && status.operationId) {
 			const pending = await this.piHarness.pending();
 			if (pending.some((operation) => operation.operationId === status.operationId)) {
 				await this.recordEvent("agent.runtime.recovered", {
@@ -104,22 +218,19 @@ export class PiAgent extends Agent<Env> {
 				}, "info", status.operationId);
 			}
 		}
+		// Sockets outlive the isolate under hibernation; give each one a new watch.
+		for (const connection of this.getConnections()) await this.watchView(connection);
+	}
+
+	/** The Event Lab speaks its own protocol; it has no use for the Agents state/identity frames. */
+	shouldSendProtocolMessages(_connection: Connection, _context: ConnectionContext): boolean {
+		return false;
 	}
 
 	async onConnect(connection: Connection): Promise<void> {
-		for (const event of await this.getEvents()) connection.send(JSON.stringify(event));
+		for (const event of await this.getEvents()) send(connection, event);
 		await this.recordEvent("client.connected", { connectionId: connection.id });
-		const watch = await this.piHarness.session().watch();
-		connection.send(JSON.stringify({ type: "pi.view", view: projectView(watch.value) }));
-		watch.start(async (call) => {
-			if (call.kind !== "value") return;
-			try {
-				connection.send(JSON.stringify({ type: "pi.view", view: projectView(call.value) }));
-			} catch (error) {
-				await this.recordEvent("agent.trajectory.stream.error", { message: errorMessage(error) }, "warn");
-			}
-		});
-		this.trajectoryWatches.set(connection.id, watch);
+		await this.watchView(connection);
 	}
 
 	async onMessage(connection: Connection, message: string | ArrayBuffer): Promise<void> {
@@ -127,7 +238,7 @@ export class PiAgent extends Agent<Env> {
 	}
 
 	async onClose(connection: Connection, code: number, reason: string, wasClean: boolean): Promise<void> {
-		await this.stopWatch(connection.id);
+		await this.unwatchView(connection.id);
 		await this.recordEvent("client.disconnected", {
 			connectionId: connection.id,
 			code,
@@ -138,9 +249,59 @@ export class PiAgent extends Agent<Env> {
 
 	async onError(connectionOrError: Connection | unknown, error?: unknown): Promise<void> {
 		if (typeof connectionOrError === "object" && connectionOrError !== null && "id" in connectionOrError) {
-			await this.stopWatch((connectionOrError as Connection).id);
+			await this.unwatchView((connectionOrError as Connection).id);
 		}
 		await this.recordEvent("agent.websocket.error", { message: errorMessage(error ?? connectionOrError) }, "error");
+	}
+
+	/**
+	 * Give a socket a new watch of the root session, replacing the one it had, and send
+	 * a projection of Pi's view on every change. A watch also ends when Pi closes (as
+	 * PiHarness does to reopen a failed Pi); the socket then gets a new watch. When Pi
+	 * cannot be watched the socket is closed so the client reconnects.
+	 */
+	private async watchView(connection: Connection): Promise<void> {
+		let watch: ConversationWatch;
+		try {
+			watch = await this.piHarness.session().watch();
+		} catch (error) {
+			console.warn(JSON.stringify({ event: "pi.view.watch_failed", agentId: this.name, error: errorMessage(error) }));
+			try {
+				connection.close(1011, "Lost the session's watch");
+			} catch {
+				// Already closed.
+			}
+			return;
+		}
+		if (connection.readyState !== SOCKET_OPEN) {
+			await watch.stop();
+			return;
+		}
+		const previous = this.viewWatches.get(connection.id);
+		this.viewWatches.set(connection.id, watch);
+		void previous?.stop();
+		send(connection, { type: "pi.view", view: projectView(watch.value) });
+		watch.start(async (call) => {
+			// Pi ends a watch on failure instead of sending a `failed` call.
+			if (call.kind !== "value") return;
+			if (connection.readyState !== SOCKET_OPEN) {
+				await this.unwatchView(connection.id);
+				return;
+			}
+			send(connection, { type: "pi.view", view: projectView(call.value) });
+		});
+		void watch.closed.then((end) => {
+			if (end.kind === "stopped" || end.kind === "aborted") return;
+			if (this.viewWatches.get(connection.id) !== watch) return;
+			this.viewWatches.delete(connection.id);
+			if (connection.readyState === SOCKET_OPEN) return this.watchView(connection);
+		});
+	}
+
+	private async unwatchView(connectionId: string): Promise<void> {
+		const watch = this.viewWatches.get(connectionId);
+		this.viewWatches.delete(connectionId);
+		if (watch) await watch.stop();
 	}
 
 	async run(prompt: string): Promise<{ text: string }> {
@@ -151,16 +312,10 @@ export class PiAgent extends Agent<Env> {
 				const result = await this.piHarness.prompt(prompt, { operationId });
 				if (result.status !== "done") throw new Error(`Pi Durable run ended unanswered: ${result.reason ?? "unknown reason"}`);
 				const text = result.text ?? "";
-				await this.saveSandbox();
 				await this.saveStatus({ status: "complete", lastResponse: text });
 				return { text };
 			});
 		} catch (error) {
-			try {
-				await this.saveSandbox();
-			} catch (snapshotError) {
-				console.error(JSON.stringify({ event: "sandbox.snapshot.failed", agentId: this.name, error: errorMessage(snapshotError) }));
-			}
 			await this.saveStatus({ status: "failed", lastError: errorMessage(error) });
 			throw error;
 		}
@@ -185,8 +340,6 @@ export class PiAgent extends Agent<Env> {
 	 * only installs extensions by name, which replaces them in place.
 	 */
 	private async openPi({ storage, context, onWake }: PiHarnessContext): Promise<Harness> {
-		await this.connectMcpServers();
-		await this.mcp.waitForConnections({ timeout: 10_000 });
 		const models = createModels();
 		models.setProvider(this.ai.provider);
 		const core = this.coreExtension();
@@ -207,6 +360,7 @@ export class PiAgent extends Agent<Env> {
 						await configure(tx, created.id, { extensions: { remove: [subagents] } });
 						return created.id;
 					}, context);
+					// Lets a UI attach to the child conversation.
 					await api.details({ conversationId: String(childId) }, context);
 					const child = await api.conversation(childId, context);
 					if (!child) throw new Error("Pi Durable child conversation was not created");
@@ -223,42 +377,50 @@ export class PiAgent extends Agent<Env> {
 		return Harness.open(storage, { models, registry: this.registry, onWake, onReport: (report) => this.report(report) }, context);
 	}
 
-	private coreExtension(): Extension {
-		const computer = createAITools({
+	/** Computer's workspace tools, one declaration list and executor shared by Pi and Code Mode. */
+	private computerTools(): CreatePiToolsResult {
+		return createPiTools({
 			workspace: this.workspace,
-			exec: { backends: { shell: { description: "Persistent workspace files and Artifacts Git repositories." } } },
+			exec: { backends: { shell: { description: "Persistent workspace files, git, and Artifacts repositories." } } },
 		});
-		const web = {
-			search: webSearchAiTool({ binding: this.env.AI, gateway: this.env.AI_GATEWAY_ID ?? "default" }),
-			fetch: webFetchAiTool({ binding: this.env.AI }),
-		};
-		const mcp = this.mcp.getAITools();
-		this.nestedToolGroups = [
-			...describeToolSet("workspace", computer),
-			...describeToolSet("web", web),
-			...describeToolSet("mcp", mcp),
-		];
-		const codeTool = createCodeTool({
-			tools: [
-				{ name: "workspace", tools: computer },
-				{ name: "web", tools: web },
-				{ name: "mcp", tools: mcp },
-			],
+	}
+
+	/**
+	 * Cloudflare Code Mode's runtime: a durable facet (`CodemodeRuntime`, exported by the
+	 * Worker) that owns the tool-call log, with connectors re-provided per call, as the
+	 * Code Mode runtime docs describe. MCP servers join through their live connections.
+	 */
+	private codemodeRuntime() {
+		const mcp = this.mcp.listServers().flatMap((server) => {
+			const connection = this.mcp.mcpConnections[server.id];
+			return connection ? [new AgentMcpConnector(this.ctx, sanitizeToolName(server.name), connection)] : [];
+		});
+		return createCodemodeRuntime({
+			ctx: this.ctx,
 			executor: new DynamicWorkerExecutor({ loader: this.env.LOADER }),
+			connectors: [
+				new WorkspaceConnector(this.ctx, this.computerTools()),
+				new WebConnector(this.ctx, this.env.AI, this.env.AI_GATEWAY_ID ?? "default"),
+				...mcp,
+			],
 		});
+	}
+
+	private coreExtension(): Extension {
 		const codeMode: ToolRegistration<typeof CodeMode> = {
 			name: "code_mode",
-			description: typeof codeTool.description === "string" ? codeTool.description : "Run code that calls the workspace, web, and mcp tool groups.",
+			description: this.codemodeRuntime().tool().description,
 			parameters: CodeMode,
-			execute: async ({ code }, api, context) => {
-				const result = await traced("agent.tool.code_mode", { "agent.tool.name": "code_mode" }, async () => {
-					const output = codeTool.execute!({ code }, { toolCallId: String(api.taskId), messages: [], abortSignal: context.abortSignal, context: {} });
-					if (!(Symbol.asyncIterator in Object(output))) return await output;
-					let final: unknown;
-					for await (const part of output as AsyncIterable<unknown>) final = part;
-					return final;
-				});
-				return { output: [{ type: "text", text: JSON.stringify(result) }] };
+			execute: async ({ code }) => {
+				await this.mcp.waitForConnections({ timeout: 10_000 });
+				const result = await traced("agent.tool.code_mode", { "agent.tool.name": "code_mode" }, () => this.codemodeRuntime().execute({ code }));
+				// The model sees everything but the durable call log, as Code Mode's own tool projects it.
+				const { calls: _calls, ...visible } = result;
+				return {
+					output: [{ type: "text", text: JSON.stringify(visible) }],
+					isError: result.status === "error",
+					details: { executionId: result.executionId, status: result.status },
+				};
 			},
 		};
 		const generateImage: ToolRegistration<typeof GenerateImage> = {
@@ -284,7 +446,7 @@ export class PiAgent extends Agent<Env> {
 			name: CORE_EXTENSION,
 			sections: [section("preamble", () => SYSTEM_PROMPT, { tag: false })],
 			tools: [
-				...workspaceTools(createPiTools({ workspace: this.workspace, readonly: true })),
+				...this.workspaceTools(),
 				webSearchTool({ binding: this.env.AI, gateway: this.env.AI_GATEWAY_ID ?? "default" }),
 				webFetchTool({ binding: this.env.AI }),
 				browserTool({ browser: this.browser, loader: this.env.LOADER }),
@@ -293,6 +455,27 @@ export class PiAgent extends Agent<Env> {
 				containerExec,
 			],
 		});
+	}
+
+	/**
+	 * Computer's workspace tools as Pi Durable registrations. `createPiTools` returns pi-ai
+	 * declarations and one `execute` for a hand-written loop; Pi runs the loop itself, so
+	 * each tool gets its own `execute` (the Agents Pi harness example's pattern).
+	 */
+	private workspaceTools(): ToolRegistration[] {
+		const { tools, execute } = this.computerTools();
+		return tools.map((tool): ToolRegistration => ({
+			name: tool.name,
+			description: tool.description,
+			parameters: tool.parameters,
+			...(tool.constrainedSampling ? { constrainedSampling: tool.constrainedSampling } : {}),
+			replay: REPLAY_SAFE_WORKSPACE_TOOLS.has(tool.name) ? "safe" : "unsafe",
+			execute: async (args, api, context) => {
+				const { content, isError } = await traced(`agent.tool.${tool.name}`, { "agent.tool.name": tool.name }, () =>
+					execute({ id: api.callId, name: tool.name, arguments: args }, { abortSignal: context.abortSignal }));
+				return { output: content, isError };
+			},
+		}));
 	}
 
 	private report(report: Report): void {
@@ -306,18 +489,11 @@ export class PiAgent extends Agent<Env> {
 		}));
 	}
 
+	/** `addMcpServer` is idempotent for the same name and URL, so `onStart` can call it on every start. */
 	private async connectMcpServers(): Promise<void> {
-		if (this.mcpServersAdded) return;
 		for (const server of parseMcpServers(this.env.MCP_SERVERS_JSON)) {
 			await this.addMcpServer(server.name, server.url, server.headers ? { transport: { headers: server.headers } } : undefined);
 		}
-		this.mcpServersAdded = true;
-	}
-
-	private async stopWatch(connectionId: string): Promise<void> {
-		const watch = this.trajectoryWatches.get(connectionId);
-		this.trajectoryWatches.delete(connectionId);
-		if (watch) await watch.stop();
 	}
 
 	private async runInContainer(command: string): Promise<string> {
@@ -370,8 +546,11 @@ export class PiAgent extends Agent<Env> {
 		if (status.status !== "running" || !status.operationId) return status;
 		const pending = await this.piHarness.pending();
 		if (pending.some((operation) => operation.operationId === status.operationId)) return status;
-		const result = await this.piHarness.wait(status.operationId);
-		if (result.status === "done") {
+		// Not pending means settled; bound the wait in case Pi never admitted this operation.
+		const result = await this.piHarness.wait(status.operationId, { signal: AbortSignal.timeout(5_000) }).catch(() => undefined);
+		if (!result) {
+			await this.saveStatus({ status: "failed", lastError: "Pi Durable has no record of this operation" });
+		} else if (result.status === "done") {
 			await this.saveStatus({ status: "complete", lastResponse: result.text ?? "" });
 		} else {
 			await this.saveStatus({ status: "failed", lastError: `Pi Durable run ended unanswered: ${result.reason ?? "unknown reason"}` });
@@ -380,7 +559,7 @@ export class PiAgent extends Agent<Env> {
 	}
 
 	async getEvents(): Promise<AgentEvent[]> {
-		return (await this.ctx.storage.get<AgentEvent[]>("agent:events")) ?? [];
+		return this.sql<{ event: string }>`SELECT event FROM agent_events ORDER BY seq`.map(({ event }) => JSON.parse(event) as AgentEvent);
 	}
 
 	async getRuntimeBootId(): Promise<string | undefined> {
@@ -474,7 +653,12 @@ export class PiAgent extends Agent<Env> {
 			},
 			hands: {
 				loadedTools,
-				nestedTools: this.nestedToolGroups,
+				nestedTools: [
+					...this.computerTools().tools.map(({ name, description }) => ({ group: "workspace", name, description })),
+					{ group: "web", name: "search", description: "Search the live web (createAIWebSearch)." },
+					{ group: "web", name: "fetch", description: "Read one URL as Markdown or raw (fetchWeb)." },
+					...this.mcp.listTools().map((tool) => ({ group: `mcp:${tool.serverId}`, name: tool.name, description: tool.description ?? "No description provided." })),
+				],
 				currentCalls: toolCalls(live),
 				recentTools,
 				workspaceFiles,
@@ -565,10 +749,19 @@ export class PiAgent extends Agent<Env> {
 			...(operationId ? { operationId } : {}),
 			...(Object.keys(details).length ? { details } : {}),
 		};
-		const events = [...await this.getEvents(), event].slice(-300);
-		await this.ctx.storage.put("agent:events", events);
+		this.sql`INSERT INTO agent_events (event) VALUES (${JSON.stringify(event)})`;
+		this.sql`DELETE FROM agent_events WHERE seq <= (SELECT MAX(seq) FROM agent_events) - ${MAX_EVENTS}`;
 		console.log(JSON.stringify({ event: type, agentId: this.name, ...event }));
 		this.broadcast(JSON.stringify(event));
+	}
+}
+
+function send(connection: Connection, message: unknown): void {
+	if (connection.readyState !== SOCKET_OPEN) return;
+	try {
+		connection.send(JSON.stringify(message));
+	} catch {
+		// The socket closed between the state check and the send.
 	}
 }
 
@@ -668,30 +861,6 @@ function inspectRecentTools(entries: readonly EntryRecord[]): AgentInspection["h
 		}
 	}
 	return calls.slice(-12).map(({ id, item }) => ({ ...item, ...(id && results.has(id) ? results.get(id) : {}) }));
-}
-
-/** Computer's read-only workspace tools, registered directly with Pi. Reads are safe to repeat after an eviction. */
-function workspaceTools(computer: CreatePiToolsResult): ToolRegistration[] {
-	return computer.tools.map((tool) => ({
-		name: tool.name,
-		description: tool.description,
-		parameters: tool.parameters,
-		replay: "safe",
-		execute: async (args, _api, context) => {
-			const result = await traced(`agent.tool.${tool.name}`, { "agent.tool.name": tool.name }, () =>
-				computer.execute({ id: crypto.randomUUID(), name: tool.name, arguments: args }, { abortSignal: context.abortSignal }));
-			return { output: result.content, isError: result.isError };
-		},
-	}));
-}
-
-function describeToolSet(group: string, tools: object): AgentInspection["hands"]["nestedTools"] {
-	return Object.entries(tools as Record<string, { description?: unknown }>).map(([name, definition]) => {
-		const description = typeof definition.description === "string"
-			? definition.description
-			: definition.description === undefined ? "No description provided." : "Description depends on runtime context.";
-		return { group, name, description };
-	});
 }
 
 function parseMcpServers(value: string | undefined) {

@@ -7,7 +7,10 @@ import type { Env } from "./types";
 import { PiAgent } from "./worker-agent";
 
 export { Orchestrator, PiAgent };
+// Facet behind Code Mode's durable runtime (`createCodemodeRuntime`), reached through ctx.exports.
 export { CodemodeRuntime } from "@cloudflare/codemode";
+// Loopback entrypoint the worker shell uses to reach the agent's Workspace, through ctx.exports.
+export { WorkspaceServiceProxy } from "@cloudflare/computer";
 
 export default {
 	async fetch(request: Request, env: Env): Promise<Response> {
