@@ -49,7 +49,7 @@ export interface ToolCallView {
 	diagnostics?: unknown[];
 }
 
-/** A compact projection of Pi's conversation view, sent to the Event Lab over its WebSocket. */
+/** A trimmed copy of Pi's conversation state, sent to the Event Lab over its WebSocket. */
 export interface ConversationSnapshot {
 	entries: TranscriptItem[];
 	running: boolean;
@@ -90,7 +90,7 @@ export interface AgentInspection {
 		recentTools: Array<{ name: string; arguments?: string; result?: string; isError?: boolean }>;
 		workspaceFiles: Array<{ path: string; type: "file" | "dir" }>;
 		artifactRepos: Array<{ name: string; description?: string }>;
-		mcpServers: Array<{ id: string; name: string; endpoint: string }>;
+		mcpServers: Array<{ id: string; name: string; endpoint: string; state: string; error?: string }>;
 		inspectionErrors: string[];
 		browser: { name: string; recentCalls: Array<{ arguments?: string; result?: string; isError?: boolean }> };
 		sandbox: { containerRunning: boolean; snapshotAvailable: boolean; snapshotName?: string; snapshotSize?: number };

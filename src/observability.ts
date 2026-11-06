@@ -1,7 +1,7 @@
 import { tracing } from "cloudflare:workers";
 import { Cause, Effect, Exit, Layer, ManagedRuntime, Schema, Tracer } from "effect";
 
-/** Logs each Effect span as structured JSON when it ends, beside Cloudflare's own traces. */
+/** Logs each Effect span as JSON when it ends. Cloudflare's traces are separate. */
 class LoggedSpan extends Tracer.NativeSpan {
 	override end(endTime: bigint, exit: Exit.Exit<unknown, unknown>): void {
 		super.end(endTime, exit);
@@ -18,7 +18,7 @@ class LoggedSpan extends Tracer.NativeSpan {
 
 const tracer = Tracer.make({ span: (options) => new LoggedSpan(options) });
 
-/** One runtime for the isolate, so every Effect program shares the tracer. */
+/** One Effect runtime per isolate, so every program uses the logging tracer. */
 export const runtime = ManagedRuntime.make(Layer.succeed(Tracer.Tracer, tracer));
 
 export class OperationFailed extends Schema.TaggedError<OperationFailed>()("OperationFailed", {
@@ -30,9 +30,9 @@ export class OperationFailed extends Schema.TaggedError<OperationFailed>()("Oper
 type SpanAttributes = Record<string, string | number | boolean | undefined>;
 
 /**
- * Runs an async operation as an Effect span inside a Cloudflare custom span.
- * Failures become `OperationFailed` with the underlying message kept, so callers
- * (and models, for tool calls) still see what went wrong.
+ * Runs an async function inside an Effect span and a Cloudflare custom span.
+ * A failure becomes `OperationFailed` with the original message, so callers (and
+ * the model, for tool calls) still see what went wrong.
  */
 export const traced = <A>(name: string, attributes: SpanAttributes, run: (signal: AbortSignal) => Promise<A>): Promise<A> =>
 	tracing.enterSpan(name, async (span) => {

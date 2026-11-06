@@ -7,9 +7,9 @@ import type { Env } from "./types";
 import { PiAgent } from "./worker-agent";
 
 export { Orchestrator, PiAgent };
-// Facet behind Code Mode's durable runtime (`createCodemodeRuntime`), reached through ctx.exports.
+// Code Mode's runtime (`createCodemodeRuntime`) stores its call log in this class; it finds it through ctx.exports.
 export { CodemodeRuntime } from "@cloudflare/codemode";
-// Loopback entrypoint the worker shell uses to reach the agent's Workspace, through ctx.exports.
+// The worker shell calls back into the agent's Workspace through this class, found through ctx.exports.
 export { WorkspaceServiceProxy } from "@cloudflare/computer";
 
 export default {
@@ -33,7 +33,11 @@ export default {
 		}
 
 		if (url.pathname === "/agents" && request.method === "GET") {
-			return json({ agents: await orchestrator.listAgents() });
+			try {
+				return json({ agents: await orchestrator.listAgents() });
+			} catch (error) {
+				return errorResponse(error);
+			}
 		}
 
 		const match = /^\/agents\/([a-f0-9-]+)(?:\/(run|events|inspect|interrupt|deadline|resume))?$/.exec(url.pathname);
@@ -92,7 +96,7 @@ const decodeRunInput = Schema.decodeUnknownSync(RunInput);
 const decodeInterruptInput = Schema.decodeUnknownSync(InterruptInput);
 const decodeDeadlineInput = Schema.decodeUnknownSync(DeadlineInput);
 
-/** Parses a JSON body and decodes it with an Effect Schema; a bad body is a 400 with the decoder's message. */
+/** Parses a JSON body and checks it with an Effect Schema. A bad body gets a 400 with the schema's message. */
 async function readBody<A>(request: Request, decode: (input: unknown) => A): Promise<A | Response> {
 	let body: unknown;
 	try {

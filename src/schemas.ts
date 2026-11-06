@@ -1,6 +1,6 @@
 import { Schema } from "effect";
 
-/** Untrusted input is decoded with Effect Schema; these are the request bodies and settings the Worker accepts. */
+/** Request bodies and settings the Worker accepts, checked with Effect Schema. */
 
 export const RunInput = Schema.Struct({
 	prompt: Schema.Trim.check(Schema.isNonEmpty({ message: "prompt must be a non-empty string" })),
@@ -22,5 +22,5 @@ const McpServer = Schema.Struct({
 
 const McpServers = Schema.fromJsonString(Schema.Array(McpServer));
 
-/** `MCP_SERVERS_JSON`: a JSON array of `{ name, url, headers? }`. Throws a readable error for a bad value. */
+/** `MCP_SERVERS_JSON`: a JSON array of `{ name, url, headers? }`. Throws an error that says what is wrong. */
 export const decodeMcpServers = Schema.decodeUnknownSync(McpServers);

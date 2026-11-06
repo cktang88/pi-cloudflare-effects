@@ -1,31 +1,31 @@
 # Implementation plan
 
-## Plan
+## Goals
 
-1. Use Pi Durable as the only agent conversation/task runtime and pin current releases in this repository.
-2. Host each agent in a named Durable Object so conversations, submissions, status, workspace files, and sandbox checkpoints survive request completion.
-3. Give agents Code Mode, Computer, browser, Web Search, MCP, Artifacts Git, image generation, and a Linux Container.
-4. Record operation status, tool outcomes, durations, errors, Effect spans, and Cloudflare platform traces.
-5. Verify a clean install, types, and Wrangler's local build; document bindings and known release limits.
-6. Create and push the requested GitHub repository once GitHub authentication is available.
+1. Run every agent conversation on Pi Durable, with dependencies pinned to current releases.
+2. Give each agent its own Durable Object, so its conversation, status, workspace files, and container snapshot outlive any one request.
+3. Give agents a workspace and shell (Computer), Code Mode, a browser, web search and fetch, MCP servers, Artifacts repositories, image generation, and a Linux container.
+4. Log run status, tool results, durations, and errors, with Effect spans and Cloudflare traces.
+5. Check a clean install, the types, and Wrangler's build; document the bindings and known limits.
 
-## TODO
+## Done
 
-- [x] Inspect the repository and read the installed library APIs.
-- [x] Check official release notes and announcements published from 2026-09-25 through 2026-10-02.
-- [x] Pin Pi Durable 1.0, Effect 4, Cloudflare Agents 0.26, Computer, Code Mode, and supporting libraries.
-- [x] Migrate Pi Durable registration to its 1.0 extension and registry APIs.
-- [x] Launch each agent as an independent named `PiAgent` Durable Object and use Agents' first-party `PiHarness` for Pi storage and lifecycle recovery.
-- [x] Add replay-safe task-owned Pi Durable child conversations for agent delegation.
-- [x] Expose Computer, Browser, Web Search, MCP, and Artifacts through Cloudflare Code Mode.
-- [x] Add durable workspace memory guidance and Workers AI image generation.
-- [x] Restore Container snapshots on demand and save a new snapshot after each shell command.
-- [x] Enable Cloudflare invocation logs and native custom spans; keep structured Effect span, status, and tool outcome logs.
-- [x] Document current setup, local dependency age override, optional MCP service suggestions, and platform limits.
-- [x] Verify `npm ci` and TypeScript using Node.js 24.19.
-- [x] Run a clean install without `legacy-peer-deps`, typecheck, and Wrangler dry-run after migrating to the first-party PiHarness.
-- [x] Upgrade to the releases current on 2026-11-06 (Pi Durable 1.5, Agents 0.33, Computer 0.10, Code Mode 0.5.6, Effect 4.1, AI SDK 7.0.163, Wrangler 4.158) and rework each integration to its current docs: pi-schema tool schemas and `output` results, `onWake`/`onReport`, `watch()` views instead of removed event streams, Agents' Pi `browser`/`web_search`/`web_fetch` tools, Computer's `tools/ai-sdk` and Cloudflare observer, Effect `ManagedRuntime`, `Schema.TaggedError`, and Schema-decoded input.
-- [x] Local smoke run with Workers AI and Artifacts stubbed: launch, status, inspect, WebSocket view, run, and resume; the run ends `model_error` as expected without a model.
-- [x] Self-review against current docs and the Agents Pi harness example: Code Mode on `createCodemodeRuntime` (createCodeTool is legacy), full workspace tools with per-tool replay, WebSocket watch reattach after hibernation and Pi reopen, MCP in `onStart`, events in SQL, no Agents protocol frames on the Event Lab socket, bounded status reconciliation, and the missing `WorkspaceServiceProxy` export that broke the worker shell.
-- [ ] Smoke-check PiHarness-backed submission and recovery against a working model binding. The local AI binding is unavailable; local Container startup also needs Docker.
-- [x] Create and push the requested GitHub repository.
+- Pinned the releases current on 2026-11-06: Pi Durable 1.5, Agents 0.33, Computer 0.10, Code Mode 0.5.6, Effect 4.1, AI SDK 7.0.163, Wrangler 4.158.
+- Each agent is a named `PiAgent` Durable Object. `PiHarness` from Agents stores Pi's data and resumes Pi after a restart.
+- `delegate` starts a subagent as a child conversation owned by the calling tool, and finds the same child if it runs again after a restart.
+- Computer's workspace tools go straight to Pi, each with its own rule for running again after a restart. The worker shell works: the Worker exports `WorkspaceServiceProxy` and the agent exposes `__getWorkspaceStub()`.
+- `code_mode` uses Code Mode's runtime (`createCodemodeRuntime`, `runtime.execute()`), with connectors for the workspace, the web, and each MCP server.
+- `browser`, `web_search`, and `web_fetch` are Agents' tools for Pi.
+- The container restores its last snapshot when it starts and saves a new one after each command.
+- The Event Lab's WebSocket gets Pi's conversation state on every change. Watches are restarted after hibernation and after Pi reopens.
+- Launched runs record their result when Pi finishes them, without waiting for a status request.
+- Events are stored in a SQL table. Request bodies and `MCP_SERVERS_JSON` are checked with Effect Schema.
+- Checked: `npm ci`, a strict typecheck, and `wrangler deploy --dry-run`.
+- Local test with Workers AI and Artifacts faked: start, status, inspect, WebSocket, run, and resume; workspace tools and shell `exec`; `code_mode` scripts using the workspace, web, and `codemode.search()`. The run ends with `model_error`, as expected without a model.
+
+## Not yet checked
+
+- A full run, restart, and recovery against real Workers AI. This container has no Cloudflare credentials.
+- `delegate`, which needs a model.
+- `container_exec`, which needs Docker locally.
+- `browser`: the call reaches Wrangler's local browser, but Chromium refuses to start as root in this container.

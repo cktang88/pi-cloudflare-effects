@@ -1,4 +1,4 @@
-// Pi Durable Event Lab browser interaction layer.
+// Event Lab page script.
 const $ = (id) => document.getElementById(id);
 const eventsEl = $("events");
 const agentStorageKey = "pi-cloudflare-demo-agent";
@@ -101,8 +101,8 @@ function showLiveResponse(text) {
   $("answer").textContent = text || "Waiting for the first response token…";
 }
 
-// Pi Durable renders state, not events: each socket message carries a compact copy of the
-// conversation view. Rows are keyed by entry id or tool slot, so a new view updates them in place.
+// Each socket message carries a trimmed copy of Pi's conversation view. Rows are keyed by
+// entry id or tool slot, so a newer view updates the same rows instead of adding new ones.
 function renderPiView(view) {
   if (!view) return;
   const at = new Date().toISOString();
@@ -124,10 +124,10 @@ function renderPiView(view) {
   }
   if (view.retry) addEvent({ id: `pi-retry-${view.retry.at}`, at, type: "Pi model request · retry scheduled", level: "warn", details: { at: new Date(view.retry.at).toISOString(), error: view.retry.error } });
   if (view.runFailure) addEvent({ id: `pi-run-failure-${connectionGeneration}-${view.runFailure.reason}`, at, type: `Pi run ended unanswered · ${view.runFailure.reason}`, level: "warn", details: view.runFailure.detail ? { detail: view.runFailure.detail } : {} });
-  addEvent({ id: `pi-view-${connectionGeneration}`, at, type: "Pi conversation view attached", details: { state: view.running ? `run in progress · ${view.turns ?? 0} tool round(s)` : "idle", inbox: (view.inbox || []).length } });
+  addEvent({ id: `pi-view-${connectionGeneration}`, at, type: "Pi conversation connected", details: { state: view.running ? `run in progress · ${view.turns ?? 0} tool round(s)` : "idle", inbox: (view.inbox || []).length } });
 }
 
-function setSocketState(state) { $("socket").textContent = `viewer: ${state}`; }
+function setSocketState(state) { $("socket").textContent = state; }
 function activeRun() { return Boolean(agentId) && currentStatus === "running"; }
 
 function updateControls() {
@@ -161,8 +161,8 @@ function setStatus(status) {
   }
   else if (status?.lastError) {
     $("answer-title").textContent = "Run result";
-    const explanation = status.lastError === "model_error"
-      ? "The model request failed (model_error). Check the run trace and Wrangler output for any underlying provider details."
+    const explanation = status.lastError.endsWith(": model_error")
+      ? "The model request failed (model_error). The event log and Wrangler output have the provider's error."
       : `Run failed: ${status.lastError}`;
     if ($("answer").textContent !== explanation) $("answer").textContent = explanation;
   }
@@ -212,7 +212,7 @@ function renderInspection(data) {
     const detail = document.createElement("span"); detail.className = "detail"; detail.textContent = `task ${task.id} · conversation ${task.conversationId}${task.owner ? ` · owner task ${task.owner}` : ""}${task.background ? " · background" : ""}${task.abortRequested ? " · abort requested" : ""}`;
     row.append(title, detail); tasks.append(row);
   }
-  if (!tasks.childElementCount) tasks.innerHTML = '<div class="empty">No live durable tasks. Settled work remains in the transcript.</div>';
+  if (!tasks.childElementCount) tasks.innerHTML = '<div class="empty">No running tasks. Finished work is in the transcript.</div>';
   const transcript = $("transcript"); transcript.replaceChildren();
   const messages = (brain.transcript || []).flatMap((entry) => (entry.messages || []).map((message) => ({ entry, message })));
   $("transcript-count").textContent = messages.length > 30 ? `30 / ${messages.length}` : String(messages.length);
@@ -243,7 +243,7 @@ function renderInspection(data) {
     const description = document.createElement("span"); description.className = "detail"; description.textContent = item.description;
     row.append(title, description); nested.append(row);
   }
-  if (!nested.childElementCount) nested.innerHTML = '<div class="empty">No nested tools are available.</div>';
+  if (!nested.childElementCount) nested.innerHTML = '<div class="empty">No Code Mode methods are available.</div>';
   const recent = $("recent-tools"); recent.replaceChildren();
   for (const item of data.hands?.recentTools || []) {
     const row = document.createElement("div"); row.className = "list-row";
@@ -277,12 +277,14 @@ function renderInspection(data) {
     const row = document.createElement("div"); row.className = "list-row";
     const title = document.createElement("strong"); title.textContent = item.name;
     const endpoint = document.createElement("span"); endpoint.className = "detail"; endpoint.textContent = item.endpoint;
-    const state = document.createElement("span"); state.className = "pill"; state.textContent = "configured · live connection not inferred";
-    row.append(title, endpoint, state); mcp.append(row);
+    const state = document.createElement("span"); state.className = "pill"; state.textContent = item.state || "unknown";
+    row.append(title, endpoint, state);
+    if (item.error) { const error = document.createElement("span"); error.className = "detail"; error.textContent = item.error; row.append(error); }
+    mcp.append(row);
   }
   if (!mcp.childElementCount) mcp.innerHTML = '<div class="empty">No MCP servers are configured on this agent.</div>';
   const browser = data.hands?.browser || {}, browserState = $("browser-state"); browserState.replaceChildren();
-  addStateCard(browserState, "Browser", `${browser.name || "browser"} · persistent across turns; each conversation has its own tab`);
+  addStateCard(browserState, "Browser", `${browser.name || "browser"} · stays open between turns; each conversation has its own tab`);
   const browserRuns = $("browser-runs"); browserRuns.replaceChildren();
   for (const item of browser.recentCalls || []) {
     const row = document.createElement("div"); row.className = "list-row";
@@ -295,7 +297,7 @@ function renderInspection(data) {
   const sandbox = data.hands?.sandbox || {};
   const sandboxState = $("sandbox-state"); sandboxState.replaceChildren();
   addStateCard(sandboxState, "Container", sandbox.containerRunning ? "running" : "stopped");
-  addStateCard(sandboxState, "Saved container snapshot", sandbox.snapshotAvailable ? `${sandbox.snapshotName || "available"}${sandbox.snapshotSize ? ` · ${sandbox.snapshotSize} bytes` : ""} · restored when the sandbox starts` : "none yet · saved after a shell tool returns");
+  addStateCard(sandboxState, "Saved container snapshot", sandbox.snapshotAvailable ? `${sandbox.snapshotName || "available"}${sandbox.snapshotSize ? ` · ${sandbox.snapshotSize} bytes` : ""} · restored when the sandbox starts` : "none yet · saved after each container_exec command");
   const calls = $("calls"); calls.replaceChildren();
   for (const call of data.hands?.currentCalls || []) {
     const row = document.createElement("div"); row.className = "list-row";
@@ -356,7 +358,7 @@ function connect() {
   setSocketState("reconnecting…"); updateControls();
   nextSocket.onopen = () => {
     if (socket !== nextSocket || generation !== connectionGeneration) return;
-    setSocketState("live · Pi trajectory and runtime events"); startPolling(generation); updateControls();
+    setSocketState("connected · live conversation and events"); startPolling(generation); updateControls();
   };
   nextSocket.onmessage = (message) => {
     if (socket !== nextSocket) return;
@@ -368,9 +370,9 @@ function connect() {
   };
   nextSocket.onclose = () => {
     if (socket !== nextSocket || generation !== connectionGeneration) return;
-    stopPolling(); setSocketState("detached · run continues; reconnect to watch again"); updateControls();
+    stopPolling(); setSocketState("disconnected · the run keeps going; reconnect to watch"); updateControls();
   };
-  nextSocket.onerror = () => { if (socket === nextSocket) setSocketState("connection trouble · reconnect to try again"); };
+  nextSocket.onerror = () => { if (socket === nextSocket) setSocketState("connection error · reconnect to try again"); };
 }
 
 async function launch() {
@@ -383,7 +385,7 @@ async function launch() {
     const code = document.createElement("code"); code.textContent = agentId; $("agent-id").replaceChildren(code);
     setStatus({ status: "running", operationId: result.operationId }); connect();
   } catch (error) { showError("demo.launch.failed", error.message); }
-  finally { requestBusy = false; $("launch").textContent = "Launch durable run"; updateControls(); }
+  finally { requestBusy = false; $("launch").textContent = "Start run"; updateControls(); }
 }
 
 async function resumeRun() {
@@ -426,7 +428,7 @@ $("crash").addEventListener("click", () => interrupt("runtime-crash"));
 $("event-search").addEventListener("input", filterEvents);
 $("event-level").addEventListener("change", filterEvents);
 $("reset-event-filters").addEventListener("click", () => { $("event-search").value = ""; $("event-level").value = ""; filterEvents(); $("event-search").focus(); });
-$("clear-view").addEventListener("click", () => { eventRows.clear(); eventsEl.innerHTML = '<div class="empty">Visible rows cleared. Reconnect to replay the Durable Object event history.</div>'; filterEvents(); });
+$("clear-view").addEventListener("click", () => { eventRows.clear(); eventsEl.innerHTML = '<div class="empty">Cleared from this page only. Reconnect to load the saved events again.</div>'; filterEvents(); });
 const tabs = [...document.querySelectorAll('[role="tab"][data-tab]')];
 function selectTab(button, moveFocus = false) {
   for (const tab of tabs) {

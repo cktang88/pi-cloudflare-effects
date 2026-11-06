@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
-  <title>Pi Durable · Field Recorder</title>
+  <title>Pi Durable · Event Lab</title>
   <link rel="stylesheet" href="/styles.css">
   <script type="module" src="/app.js"></script>
 </head>
@@ -12,11 +12,11 @@
   <main class="shell">
     <header class="masthead">
       <div>
-        <div class="eyebrow"><span class="brand-mark" aria-hidden="true">P·D</span> Pi Durable / Field Recorder</div>
+        <div class="eyebrow"><span class="brand-mark" aria-hidden="true">P·D</span> Pi Durable / Event Lab</div>
         <h1>Watch an agent work.</h1>
-        <p class="intro">Follow the run live. Open details only when you need them.</p>
+        <p class="intro">Run a task, watch each step, and try a restart or an abort.</p>
       </div>
-      <span class="local">Local instrument · private to this machine</span>
+      <span class="local">Runs on localhost only</span>
     </header>
 
     <section class="status-strip" aria-label="Selected run status">
@@ -26,9 +26,9 @@
         <div id="agent-id" class="agent-id"><code>No agent selected</code></div>
       </div>
       <div class="observer-readout">
-        <span class="section-kicker">Observer link</span>
+        <span class="section-kicker">Event stream</span>
         <div id="socket" class="socket" role="status">Waiting for a run</div>
-        <span class="hint">Disconnecting the viewer leaves the durable run alone.</span>
+        <span class="hint">Disconnecting this page does not stop the run.</span>
       </div>
     </section>
 
@@ -36,9 +36,9 @@
       <section class="instrument panel" aria-labelledby="recorder-title">
         <div class="instrument-head">
           <div>
-            <span class="section-kicker">01 / Observability</span>
-            <h2 id="recorder-title">Flight recorder</h2>
-            <p class="panel-intro">One chronological account of what the runtime accepted, did, and saved.</p>
+            <span class="section-kicker">01 / Events</span>
+            <h2 id="recorder-title">Event log</h2>
+            <p class="panel-intro">What the agent received, did, and saved, oldest first.</p>
           </div>
           <button id="clear-view" title="Clear only the events shown in this browser">Clear view</button>
         </div>
@@ -47,107 +47,106 @@
           <section class="trace-column" aria-labelledby="trace-title">
             <div class="event-head">
               <div>
-                <span class="section-kicker">Durable event history</span>
-                <h3 id="trace-title">Run trace</h3>
+                <span class="section-kicker">Saved events</span>
+                <h3 id="trace-title">Run events</h3>
               </div>
               <span class="trace-key"><i aria-hidden="true"></i> newest at bottom</span>
             </div>
             <details class="filter-drawer"><summary><span aria-hidden="true">⌕</span> Filters <span id="event-count" class="event-count" role="status" aria-live="polite">0 events</span></summary>
-            <div class="event-controls" role="group" aria-label="Filter run trace">
-              <label for="event-search">Find in trace<input id="event-search" type="search" placeholder="Event, tool, operation…" autocomplete="off"></label>
+            <div class="event-controls" role="group" aria-label="Filter run events">
+              <label for="event-search">Search<input id="event-search" type="search" placeholder="Event, tool, operation…" autocomplete="off"></label>
               <label for="event-level">Severity<select id="event-level"><option value="">All levels</option><option value="info">Info</option><option value="warn">Warning</option><option value="error">Error</option></select></label>
               <button id="reset-event-filters" type="button">Reset filters</button>
             </div>
             </details>
             <div id="events" class="events event-rail" aria-live="polite" aria-relevant="additions">
-              <div class="empty"><strong>Awaiting a run</strong><span>Launch the sample task to watch submissions, tool calls, status changes, and reconnect replay arrive in order.</span></div>
+              <div class="empty"><strong>No run yet</strong><span>Start the sample task to see prompts, tool calls, and status changes as they happen.</span></div>
             </div>
             <div class="answer">
               <div class="answer-top">
                 <span id="answer-title" class="answer-title">Run result</span>
                 <span class="model-indicator">Model <strong id="model-name">GLM 5.3 Flash · Workers AI</strong></span>
               </div>
-              <pre id="answer">The final response will be kept with this run.</pre>
+              <pre id="answer">The final answer appears here and is saved with the run.</pre>
             </div>
           </section>
 
-          <section class="inspection-column" aria-label="Live Pi Durable inspection">
+          <section class="inspection-column" aria-label="Agent state">
             <div class="inspect-heading">
-              <span class="section-kicker">02 / Inside the run</span>
-              <p>Live snapshots refresh while the observer link is connected.</p>
+              <span class="section-kicker">02 / Agent state</span>
+              <p>Refreshes about once a second while the event stream is connected.</p>
             </div>
-            <div class="tabs" role="tablist" aria-label="Runtime inspection">
-              <button id="tab-brain" class="tab active" data-tab="brain" role="tab" aria-selected="true" aria-controls="view-brain" tabindex="0">Brain</button>
-              <button id="tab-hands" class="tab" data-tab="hands" role="tab" aria-selected="false" aria-controls="view-hands" tabindex="-1">Hands</button>
+            <div class="tabs" role="tablist" aria-label="Agent state">
+              <button id="tab-brain" class="tab active" data-tab="brain" role="tab" aria-selected="true" aria-controls="view-brain" tabindex="0">Model</button>
+              <button id="tab-hands" class="tab" data-tab="hands" role="tab" aria-selected="false" aria-controls="view-hands" tabindex="-1">Tools</button>
             </div>
             <section id="view-brain" role="tabpanel" aria-labelledby="tab-brain" tabindex="0">
-              <div id="brain-summary" class="state-grid"><div class="empty">Start a run to inspect the live agent.</div></div>
-              <details class="instructions"><summary>Base agent instructions</summary><pre id="instructions">Instructions appear when a run is selected.</pre></details>
-              <details class="inspect-group" id="task-group"><summary><span class="group-icon" aria-hidden="true">◉</span><span>Live tasks</span><span id="task-count" class="group-count">0</span></summary><div id="durable-tasks" class="list"><div class="empty">No live durable tasks.</div></div></details>
-              <details class="inspect-group"><summary><span class="group-icon" aria-hidden="true">▤</span><span>Conversation transcript</span><span id="transcript-count" class="group-count">0</span></summary><div id="transcript" class="list"><div class="empty">No transcript entries yet.</div></div><p class="privacy-note">Thinking blocks are omitted. Transcript and tool details stay in this local inspector.</p></details>
-              <details class="inspect-group"><summary><span class="group-icon" aria-hidden="true">⌘</span><span>Runtime details</span></summary><div id="brain-extra" class="state-grid"></div></details>
+              <div id="brain-summary" class="state-grid"><div class="empty">Start a run to see the agent's state.</div></div>
+              <details class="instructions"><summary>System prompt</summary><pre id="instructions">Instructions appear when a run is selected.</pre></details>
+              <details class="inspect-group" id="task-group"><summary><span class="group-icon" aria-hidden="true">◉</span><span>Running tasks</span><span id="task-count" class="group-count">0</span></summary><div id="durable-tasks" class="list"><div class="empty">No running tasks.</div></div></details>
+              <details class="inspect-group"><summary><span class="group-icon" aria-hidden="true">▤</span><span>Conversation transcript</span><span id="transcript-count" class="group-count">0</span></summary><div id="transcript" class="list"><div class="empty">No transcript entries yet.</div></div><p class="privacy-note">Thinking is not shown. This page is only served on localhost.</p></details>
+              <details class="inspect-group"><summary><span class="group-icon" aria-hidden="true">⌘</span><span>More details</span></summary><div id="brain-extra" class="state-grid"></div></details>
             </section>
             <section id="view-hands" role="tabpanel" aria-labelledby="tab-hands" tabindex="0" hidden>
               <div id="inspection-errors" class="list"></div>
               <div id="hands-summary" class="state-grid"></div>
-              <details class="inspect-group"><summary><span class="group-icon" aria-hidden="true">▣</span><span>Workspace files</span><span id="workspace-count" class="group-count">0</span></summary><div id="workspace-files" class="list"><div class="empty">Workspace files appear after inspection.</div></div></details>
+              <details class="inspect-group"><summary><span class="group-icon" aria-hidden="true">▣</span><span>Workspace files</span><span id="workspace-count" class="group-count">0</span></summary><div id="workspace-files" class="list"><div class="empty">No workspace files yet.</div></div></details>
               <details class="inspect-group"><summary><span class="group-icon" aria-hidden="true">⚒</span><span>Active calls</span><span id="calls-count" class="group-count">0</span></summary><div id="calls" class="list"><div class="empty">No active tool calls.</div></div></details>
-              <details class="inspect-group"><summary><span class="group-icon" aria-hidden="true">↻</span><span>Recent tool calls</span><span id="recent-tools-count" class="group-count">0</span></summary><div id="recent-tools" class="list"><div class="empty">Completed calls appear after the first turn.</div></div></details>
-              <details class="inspect-group"><summary><span class="group-icon" aria-hidden="true">⌘</span><span>Tool catalog</span><span id="tool-count" class="group-count">0</span></summary><div class="event-head"><div><span class="section-kicker">Registered with Pi Durable</span><h3>Loaded tools</h3></div></div><div id="tools" class="list"><div class="empty">Loaded tool registrations appear here.</div></div><div class="event-head"><div><span class="section-kicker">Inside Code Mode</span><h3>Nested tools</h3></div></div><div id="nested-tools" class="list"><div class="empty">Nested tools appear here.</div></div></details>
+              <details class="inspect-group"><summary><span class="group-icon" aria-hidden="true">↻</span><span>Recent tool calls</span><span id="recent-tools-count" class="group-count">0</span></summary><div id="recent-tools" class="list"><div class="empty">No finished tool calls yet.</div></div></details>
+              <details class="inspect-group"><summary><span class="group-icon" aria-hidden="true">⌘</span><span>Tool catalog</span><span id="tool-count" class="group-count">0</span></summary><div class="event-head"><div><span class="section-kicker">Offered to the model</span><h3>Tools</h3></div></div><div id="tools" class="list"><div class="empty">No tools yet.</div></div><div class="event-head"><div><span class="section-kicker">Callable from code_mode scripts</span><h3>Code Mode methods</h3></div></div><div id="nested-tools" class="list"><div class="empty">No Code Mode methods yet.</div></div></details>
               <details class="inspect-group"><summary><span class="group-icon" aria-hidden="true">◈</span><span>Browser, MCP &amp; artifacts</span></summary>
               <div class="event-head"><div><span class="section-kicker">Cloudflare Artifacts</span><h3>Attached repositories</h3></div></div>
-              <div id="artifact-repos" class="list"><div class="empty">Artifact repositories appear after inspection.</div></div>
-              <div class="event-head"><div><span class="section-kicker">Model Context Protocol</span><h3>Configured MCP servers</h3></div></div>
-              <p class="hint">This lists saved server configuration. It does not claim the current transport is connected.</p>
-              <div id="mcp-servers" class="list"><div class="empty">MCP servers appear after inspection.</div></div>
-              <div class="event-head"><div><span class="section-kicker">Browser Run</span><h3>Persistent browser and recent calls</h3></div></div>
-              <div id="browser-state" class="state-grid"><div class="empty">Browser state appears after inspection.</div></div>
-              <div id="browser-runs" class="list"><div class="empty">Browser calls appear after inspection.</div></div>
+              <div id="artifact-repos" class="list"><div class="empty">No Artifacts repositories yet.</div></div>
+              <div class="event-head"><div><span class="section-kicker">Model Context Protocol</span><h3>MCP servers</h3></div></div>
+                            <div id="mcp-servers" class="list"><div class="empty">No MCP servers configured.</div></div>
+              <div class="event-head"><div><span class="section-kicker">Browser Run</span><h3>Browser and recent calls</h3></div></div>
+              <div id="browser-state" class="state-grid"><div class="empty">No browser state yet.</div></div>
+              <div id="browser-runs" class="list"><div class="empty">No browser calls yet.</div></div>
               </details>
-              <details class="inspect-group"><summary><span class="group-icon" aria-hidden="true">▧</span><span>Container &amp; recovery</span></summary><div class="event-head"><div><span class="section-kicker">Sandbox recovery</span><h3>Latest container snapshot</h3></div></div><div id="sandbox-state" class="state-grid"><div class="empty">Sandbox state appears after inspection.</div></div></details>
+              <details class="inspect-group"><summary><span class="group-icon" aria-hidden="true">▧</span><span>Container</span></summary><div class="event-head"><div><span class="section-kicker">container_exec</span><h3>Latest container snapshot</h3></div></div><div id="sandbox-state" class="state-grid"><div class="empty">No container state yet.</div></div></details>
             </section>
           </section>
         </div>
       </section>
 
       <aside class="runbook panel" aria-labelledby="runbook-title">
-        <span class="section-kicker">00 / Runbook</span>
-        <h2 id="runbook-title">Restock plan demo</h2>
-        <p class="panel-intro">Restock a small warehouse and save the reorder plan.</p>
-        <details class="task-editor"><summary><span aria-hidden="true">✎</span> Edit task brief</summary>
-        <label for="prompt">Task instructions</label>
-        <textarea id="prompt">You are helping a small warehouse. A shipment arrived with 8 desk lamps and 3 keyboards. Current stock is 2 desk lamps and 5 keyboards. The target stock is 6 lamps and 4 keyboards. Use the workspace tools through code_mode to write /restock-plan.md with the quantities to reorder and a short explanation. Then report the file you created and the reorder quantities.</textarea></details>
+        <span class="section-kicker">00 / Task</span>
+        <h2 id="runbook-title">Warehouse restock</h2>
+        <p class="panel-intro">The agent works out what to reorder and saves a plan file.</p>
+        <details class="task-editor"><summary><span aria-hidden="true">✎</span> Edit the prompt</summary>
+        <label for="prompt">Prompt</label>
+        <textarea id="prompt">You are helping a small warehouse. A shipment arrived with 8 desk lamps and 3 keyboards. Current stock is 2 desk lamps and 5 keyboards. The target stock is 6 lamps and 4 keyboards. Use the workspace tools to write /restock-plan.md with the quantities to reorder and a short explanation. Then report the file you created and the reorder quantities.</textarea></details>
         <div class="action-stack">
-          <button id="launch" class="primary">Launch durable run <span aria-hidden="true">↗</span></button>
+          <button id="launch" class="primary">Start run <span aria-hidden="true">↗</span></button>
           <button id="new-run" disabled>New agent · fresh conversation</button>
         </div>
-        <p class="hint">The run continues if this page disconnects.</p>
+        <p class="hint">The run keeps going if you close this page.</p>
 
         <div class="rule-break"></div>
-        <details class="experiment-drawer"><summary><span class="section-kicker">03 / Experiments</span><strong>Simulate a failure or disconnect</strong><span aria-hidden="true">＋</span></summary>
-        <p class="panel-intro">Controls unlock while the selected run is active.</p>
+        <details class="experiment-drawer"><summary><span class="section-kicker">03 / Try it</span><strong>Disconnect, abort, or restart</strong><span aria-hidden="true">＋</span></summary>
+        <p class="panel-intro">These buttons work while a run is in progress.</p>
 
         <article class="experiment">
-          <div><span class="experiment-index">A</span><div><strong>Leave the observer</strong><p>Close only this event socket. PiHarness keeps working.</p></div></div>
+          <div><span class="experiment-index">A</span><div><strong>Disconnect this page</strong><p>Close the event stream. The run keeps going; reconnect to catch up.</p></div></div>
           <div class="buttons"><button id="disconnect" disabled>Disconnect viewer</button><button id="resume-run" disabled>Resume run</button></div>
         </article>
         <article class="experiment">
-          <div><span class="experiment-index">B</span><div><strong>Apply a deadline</strong><p>Schedule a durable app timer that aborts the current operation in five seconds.</p></div></div>
+          <div><span class="experiment-index">B</span><div><strong>Abort the run</strong><p>Abort now, or schedule an abort in five seconds. The schedule is saved, so it fires even after a restart.</p></div></div>
           <div class="buttons"><button id="arm-timeout" class="warn" disabled>Arm 5-second deadline</button><button id="timeout" class="warn" disabled>Abort now</button></div>
         </article>
         <article class="experiment experiment-danger">
-          <div><span class="experiment-index">C</span><div><strong>Restart the Durable Object</strong><p>Force an abrupt object restart while Pi Durable work is pending. On activation, Pi Durable reloads its saved session and resumes the operation. This does not exhaust actual Worker memory.</p></div></div>
-          <div class="buttons"><button id="crash" class="danger" disabled>Restart · resume saved work</button></div>
+          <div><span class="experiment-index">C</span><div><strong>Restart the Durable Object</strong><p>Force the agent's Durable Object to restart mid-run. Pi Durable reloads its saved conversation and carries on with the same run. (This calls <code>ctx.abort()</code>; it does not run out of memory.)</p></div></div>
+          <div class="buttons"><button id="crash" class="danger" disabled>Restart and resume</button></div>
         </article>
         </details>
       </aside>
     </div>
 
-    <details class="notes-drawer" aria-label="How to read this instrument"><summary><span aria-hidden="true">ⓘ</span> How recovery works</summary><footer class="notes">
-      <div class="note"><strong>Durable means saved</strong>Events are kept by the agent and sent again when the viewer reconnects.</div>
-      <div class="note"><strong>Deadline means abort</strong>This app-level timer calls PiHarness abort. It is not a Cloudflare execution timeout.</div>
-      <div class="note"><strong>Replay is policy</strong>The Hands view shows configured tool policy; the actual replay decision depends on the operation state.</div>
-      <div class="note"><strong>Restart keeps Pi state</strong>Pi Durable stores the transcript and pending tasks in Durable Object storage. Recovery can call the model again to continue from its saved state; it cannot restore hidden model activations.</div>
+    <details class="notes-drawer" aria-label="How recovery works"><summary><span aria-hidden="true">ⓘ</span> How recovery works</summary><footer class="notes">
+      <div class="note"><strong>Events are saved</strong>The agent keeps the last 300 events and sends them again when this page reconnects.</div>
+      <div class="note"><strong>The deadline is an abort</strong>It is this app's own timer, which calls <code>PiHarness.abort()</code>. It is not a Cloudflare time limit.</div>
+      <div class="note"><strong>Replay settings</strong>The Tools tab shows whether each tool may run again after a restart. Whether a given call does depends on where the restart cut it off.</div>
+      <div class="note"><strong>What a restart keeps</strong>Pi Durable saves the conversation and unfinished tasks in Durable Object storage. After a restart it asks the model again from that saved point; an answer that was mid-stream is retried.</div>
     </footer></details>
   </main>
 </body>

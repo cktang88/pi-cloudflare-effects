@@ -41,8 +41,16 @@ import type { AgentEvent, AgentInspection, AgentStatus, ConversationSnapshot, De
 const DEFAULT_MODEL = "@cf/zai-org/glm-5.3-flash";
 const CORE_EXTENSION = "cloudflare-agent-tools";
 const SUBAGENT_EXTENSION = "durable-subagents";
-const SYSTEM_PROMPT = `You are a careful, resourceful agent running on Pi Durable. Your conversation, tasks, and submissions are durable and resumable. You have a persistent workspace (read, write, edit, delete, ls, find, grep, and exec in a shell with git and Artifacts), a resumable Linux sandbox, web search and fetch, a persistent browser, and connected MCP tools. Use code_mode to combine multi-step workspace, web, and MCP work in one script; inside it, codemode.search() and codemode.describe() find the available methods. Keep durable facts that will help future runs in /memory.md in the workspace. Work in small verified steps, and report important actions and errors clearly.`;
-/** Computer tools that can run again after an eviction cut them off (as in the Agents Pi harness example). */
+const SYSTEM_PROMPT = `You are an agent running on Pi Durable. Your conversation and work are saved, so a restart resumes where you stopped.
+
+Tools:
+- Workspace files that persist between runs: read, write, edit, delete, ls, find, grep, and exec (a shell with git and Artifacts commands).
+- container_exec: a Linux container whose files are saved between commands. It is separate from the workspace.
+- web_search, web_fetch, and browser.
+- code_mode: one script that calls workspace.*, web.*, and MCP server methods. Inside it, codemode.search() and codemode.describe() list what is available.
+
+Save facts that will help later runs in /memory.md. Check each step before the next, and say what you did and what failed.`;
+/** Computer tools that are safe to run again if a restart interrupts them (same list as the Agents Pi harness example). */
 const REPLAY_SAFE_WORKSPACE_TOOLS = new Set(["read", "ls", "find", "grep", "write", "delete"]);
 const MAX_EVENTS = 300;
 /** `WebSocket.OPEN`; the constant is not defined on every runtime's global. */
@@ -56,13 +64,13 @@ const GenerateImage = obj({
 const ContainerExec = obj({ command: str({ minLength: 1, maxLength: 16_384 }) });
 const CodeMode = obj({ code: str({ minLength: 1, description: "An async arrow function. Connector methods are globals (workspace.*, web.*, and one per MCP server); codemode.search() and codemode.describe() find them." }) });
 
-/** Reads that Code Mode may re-run on replay instead of storing their (possibly large) results. */
+/** Reads Code Mode runs again when a script resumes, instead of storing their results. */
 const WORKSPACE_READS = new Set(["read", "ls", "find", "grep"]);
 
 /**
- * Computer's workspace tools as a Code Mode connector, over the same framework-neutral
- * executor (`createPiTools`) the direct Pi tools use. Scripts get each tool's structured
- * result; a failed call throws in the script with the tool's message.
+ * Computer's workspace tools for Code Mode scripts, run by the same `createPiTools`
+ * executor as the tools Pi calls directly. A script gets each tool's structured result;
+ * a failed call throws in the script with the tool's message.
  */
 class WorkspaceConnector extends CodemodeConnector {
 	constructor(ctx: DurableObjectState, private readonly computer: CreatePiToolsResult) {
@@ -93,9 +101,9 @@ class WorkspaceConnector extends CodemodeConnector {
 }
 
 /**
- * Web Search and Web Fetch as a Code Mode connector, on the host-side sources Agents
- * documents for use without a model (`createAIWebSearch`, `fetchWeb`). Scripts get the
- * full search response and the whole page; the model sees only what the script returns.
+ * Web search and fetch for Code Mode scripts, using the functions Agents provides for
+ * calling them without a model (`createAIWebSearch`, `fetchWeb`). A script gets the full
+ * search response and the whole page; the model sees only what the script returns.
  */
 class WebConnector extends CodemodeConnector {
 	constructor(ctx: DurableObjectState, private readonly ai: Ai, private readonly gateway: string) {
@@ -137,7 +145,7 @@ class WebConnector extends CodemodeConnector {
 	}
 }
 
-/** One configured MCP server as a Code Mode connector, over the Agent's live MCP connection. */
+/** One configured MCP server for Code Mode scripts, using the agent's open MCP connection. */
 class AgentMcpConnector extends McpConnector {
 	constructor(ctx: DurableObjectState, private readonly connectorName: string, private readonly connection: McpConnectionLike) {
 		super(ctx as unknown as ExecutionContext, {});
@@ -157,10 +165,10 @@ class AgentMcpConnector extends McpConnector {
 }
 
 export class PiAgent extends Agent<Env> {
-	/** Pi's conversation watches live in memory, one per socket; `onStart` reattaches them after hibernation. */
+	/** One Pi conversation watch per socket. They live in memory, so `onStart` starts them again after hibernation. */
 	private readonly viewWatches = new Map<string, ConversationWatch>();
 	readonly ai = createAI({ binding: this.env.AI });
-	/** One registry per object: Pi keeps each Harness subscribed to it until the Harness closes. */
+	/** One registry per object, not per module: a Harness stays subscribed to its registry until it closes. */
 	readonly registry = createRegistry();
 	readonly browser = new Browser({ provider: browserRun(this.env.BROWSER) });
 	readonly workspace = new Workspace({
@@ -189,16 +197,16 @@ export class PiAgent extends Agent<Env> {
 	}
 
 	/**
-	 * The worker shell's Dynamic Worker reaches this Workspace through the exported
-	 * `WorkspaceServiceProxy`, which calls this. `withWorkspace` would install it; this
-	 * class constructs its Workspace directly, so it exposes the stub itself.
+	 * The worker shell runs in a Dynamic Worker and reaches this Workspace through the
+	 * exported `WorkspaceServiceProxy`, which calls this method. `withWorkspace` would add
+	 * it; this class creates its Workspace directly, so it defines the method itself.
 	 */
 	async __getWorkspaceStub() {
 		await this.workspace.ready();
 		return this.workspace.stub();
 	}
 
-	/** Host startup. Lifecycle capabilities (Browser, PiHarness) have already started, so Pi is open. */
+	/** Runs on every start, after Browser and PiHarness have started, so Pi is already open. */
 	async onStart(): Promise<void> {
 		this.sql`CREATE TABLE IF NOT EXISTS agent_events (seq INTEGER PRIMARY KEY AUTOINCREMENT, event TEXT NOT NULL)`;
 		await this.connectMcpServers();
@@ -208,21 +216,23 @@ export class PiAgent extends Agent<Env> {
 		const status = await this.ctx.storage.get<AgentStatus>("agent:status");
 		if (!status) {
 			await this.saveStatus({ status: "idle" });
-		} else if (previousBootId && status.status === "running" && status.operationId) {
+		} else if (status.status === "running" && status.operationId) {
 			const pending = await this.piHarness.pending();
-			if (pending.some((operation) => operation.operationId === status.operationId)) {
+			if (previousBootId && pending.some((operation) => operation.operationId === status.operationId)) {
 				await this.recordEvent("agent.runtime.recovered", {
 					previousBootId,
 					bootId,
-					mechanism: "PiHarness reopened Pi Durable and resumed its stored tasks",
+					mechanism: "PiHarness reopened Pi, which resumed its saved tasks",
 				}, "info", status.operationId);
 			}
+			// Not awaited: startup must not wait for the run to finish.
+			void this.settleWhenDone(status.operationId);
 		}
-		// Sockets outlive the isolate under hibernation; give each one a new watch.
+		// Sockets stay open while the object hibernates; give each one a new watch.
 		for (const connection of this.getConnections()) await this.watchView(connection);
 	}
 
-	/** The Event Lab speaks its own protocol; it has no use for the Agents state/identity frames. */
+	/** The Event Lab has its own messages, so skip the Agents state and identity messages. */
 	shouldSendProtocolMessages(_connection: Connection, _context: ConnectionContext): boolean {
 		return false;
 	}
@@ -255,10 +265,10 @@ export class PiAgent extends Agent<Env> {
 	}
 
 	/**
-	 * Give a socket a new watch of the root session, replacing the one it had, and send
-	 * a projection of Pi's view on every change. A watch also ends when Pi closes (as
-	 * PiHarness does to reopen a failed Pi); the socket then gets a new watch. When Pi
-	 * cannot be watched the socket is closed so the client reconnects.
+	 * Starts a watch of the root conversation for a socket, replacing its old one, and
+	 * sends the conversation state on every change. A watch also ends when Pi closes (as
+	 * PiHarness does to reopen Pi after an error); the socket then gets a new watch. If
+	 * Pi can't be watched, the socket is closed so the page reconnects.
 	 */
 	private async watchView(connection: Connection): Promise<void> {
 		let watch: ConversationWatch;
@@ -310,13 +320,13 @@ export class PiAgent extends Agent<Env> {
 			return await traced("agent.run", { "agent.id": this.name, "agent.operation_id": operationId }, async () => {
 				await this.saveStatus({ status: "running", operationId });
 				const result = await this.piHarness.prompt(prompt, { operationId });
-				if (result.status !== "done") throw new Error(`Pi Durable run ended unanswered: ${result.reason ?? "unknown reason"}`);
+				if (result.status !== "done") throw new Error(unansweredMessage(result.reason));
 				const text = result.text ?? "";
-				await this.saveStatus({ status: "complete", lastResponse: text });
+				await this.finishRun(operationId, { status: "complete", lastResponse: text });
 				return { text };
 			});
 		} catch (error) {
-			await this.saveStatus({ status: "failed", lastError: errorMessage(error) });
+			await this.finishRun(operationId, { status: "failed", lastError: errorMessage(error) });
 			throw error;
 		}
 	}
@@ -331,13 +341,29 @@ export class PiAgent extends Agent<Env> {
 				await this.saveStatus({ status: "failed", lastError: errorMessage(error) });
 				throw error;
 			}
+			void this.settleWhenDone(operationId);
 			return { operationId };
 		});
 	}
 
 	/**
-	 * PiHarness's factory. It can run more than once (after a storage error), so it
-	 * only installs extensions by name, which replaces them in place.
+	 * Records a launched run's result when Pi finishes it, so the status changes even if
+	 * nobody asks. If the object is evicted first, `onStart` calls this again.
+	 */
+	private async settleWhenDone(operationId: string): Promise<void> {
+		try {
+			const result = await this.piHarness.wait(operationId);
+			await this.finishRun(operationId, result.status === "done"
+				? { status: "complete", lastResponse: result.text ?? "" }
+				: { status: "failed", lastError: unansweredMessage(result.reason) });
+		} catch (error) {
+			console.warn(JSON.stringify({ event: "agent.settle.failed", agentId: this.name, operationId, error: errorMessage(error) }));
+		}
+	}
+
+	/**
+	 * Opens Pi for PiHarness. It can run more than once (after a storage error), which is
+	 * fine: installing an extension with the same name replaces the old one.
 	 */
 	private async openPi({ storage, context, onWake }: PiHarnessContext): Promise<Harness> {
 		const models = createModels();
@@ -349,18 +375,18 @@ export class PiAgent extends Agent<Env> {
 				name: "delegate",
 				description: "Launch a durable subagent for a focused task and return its answer.",
 				parameters: Delegate,
-				// A rerun after an eviction finds the same child conversation and submission.
+				// If a restart reruns this call, it finds the same child conversation and prompt.
 				replay: "safe",
 				execute: async ({ task }, api, context) => {
 					const childId = await api.commit(async (tx) => {
 						const existing = (await tx.scanConversations({ ownerTaskId: api.taskId }, 1)).items[0];
 						if (existing !== undefined) return existing.id;
-						// A task-owned conversation starts as a copy of this one's agent; it gets no subagents of its own.
+						// The child starts with this conversation's settings; it can't start subagents of its own.
 						const created = await tx.createConversation({ ownership: { kind: "task", taskId: api.taskId } });
 						await configure(tx, created.id, { extensions: { remove: [subagents] } });
 						return created.id;
 					}, context);
-					// Lets a UI attach to the child conversation.
+					// Lets a UI find the child conversation.
 					await api.details({ conversationId: String(childId) }, context);
 					const child = await api.conversation(childId, context);
 					if (!child) throw new Error("Pi Durable child conversation was not created");
@@ -377,7 +403,7 @@ export class PiAgent extends Agent<Env> {
 		return Harness.open(storage, { models, registry: this.registry, onWake, onReport: (report) => this.report(report) }, context);
 	}
 
-	/** Computer's workspace tools, one declaration list and executor shared by Pi and Code Mode. */
+	/** Computer's workspace tools: one list of tools and one executor, used by both Pi and Code Mode. */
 	private computerTools(): CreatePiToolsResult {
 		return createPiTools({
 			workspace: this.workspace,
@@ -386,9 +412,9 @@ export class PiAgent extends Agent<Env> {
 	}
 
 	/**
-	 * Cloudflare Code Mode's runtime: a durable facet (`CodemodeRuntime`, exported by the
-	 * Worker) that owns the tool-call log, with connectors re-provided per call, as the
-	 * Code Mode runtime docs describe. MCP servers join through their live connections.
+	 * Code Mode's runtime. Its call log lives in the `CodemodeRuntime` class the Worker
+	 * exports; the connectors are built fresh for each call, as Code Mode's docs describe.
+	 * MCP servers are added through the agent's open connections.
 	 */
 	private codemodeRuntime() {
 		const mcp = this.mcp.listServers().flatMap((server) => {
@@ -414,7 +440,7 @@ export class PiAgent extends Agent<Env> {
 			execute: async ({ code }) => {
 				await this.mcp.waitForConnections({ timeout: 10_000 });
 				const result = await traced("agent.tool.code_mode", { "agent.tool.name": "code_mode" }, () => this.codemodeRuntime().execute({ code }));
-				// The model sees everything but the durable call log, as Code Mode's own tool projects it.
+				// The model gets everything except the call log, as with Code Mode's own tool.
 				const { calls: _calls, ...visible } = result;
 				return {
 					output: [{ type: "text", text: JSON.stringify(visible) }],
@@ -458,9 +484,9 @@ export class PiAgent extends Agent<Env> {
 	}
 
 	/**
-	 * Computer's workspace tools as Pi Durable registrations. `createPiTools` returns pi-ai
-	 * declarations and one `execute` for a hand-written loop; Pi runs the loop itself, so
-	 * each tool gets its own `execute` (the Agents Pi harness example's pattern).
+	 * Computer's workspace tools for Pi. `createPiTools` returns tool declarations and one
+	 * `execute` function meant for a hand-written loop. Pi runs its own loop, so each tool
+	 * gets its own `execute` (as in the Agents Pi harness example).
 	 */
 	private workspaceTools(): ToolRegistration[] {
 		const { tools, execute } = this.computerTools();
@@ -489,7 +515,7 @@ export class PiAgent extends Agent<Env> {
 		}));
 	}
 
-	/** `addMcpServer` is idempotent for the same name and URL, so `onStart` can call it on every start. */
+	/** Adding a server with the same name and URL does nothing, so this is safe on every start. */
 	private async connectMcpServers(): Promise<void> {
 		for (const server of parseMcpServers(this.env.MCP_SERVERS_JSON)) {
 			await this.addMcpServer(server.name, server.url, server.headers ? { transport: { headers: server.headers } } : undefined);
@@ -546,15 +572,13 @@ export class PiAgent extends Agent<Env> {
 		if (status.status !== "running" || !status.operationId) return status;
 		const pending = await this.piHarness.pending();
 		if (pending.some((operation) => operation.operationId === status.operationId)) return status;
-		// Not pending means settled; bound the wait in case Pi never admitted this operation.
+		// Not pending means finished. The timeout covers a run Pi never accepted.
 		const result = await this.piHarness.wait(status.operationId, { signal: AbortSignal.timeout(5_000) }).catch(() => undefined);
-		if (!result) {
-			await this.saveStatus({ status: "failed", lastError: "Pi Durable has no record of this operation" });
-		} else if (result.status === "done") {
-			await this.saveStatus({ status: "complete", lastResponse: result.text ?? "" });
-		} else {
-			await this.saveStatus({ status: "failed", lastError: `Pi Durable run ended unanswered: ${result.reason ?? "unknown reason"}` });
-		}
+		await this.finishRun(status.operationId, !result
+			? { status: "failed", lastError: "Pi Durable has no record of this run" }
+			: result.status === "done"
+				? { status: "complete", lastResponse: result.text ?? "" }
+				: { status: "failed", lastError: unansweredMessage(result.reason) });
 		return (await this.ctx.storage.get<AgentStatus>("agent:status")) ?? status;
 	}
 
@@ -573,7 +597,7 @@ export class PiAgent extends Agent<Env> {
 			return { resumed: false, status: status.status, ...(status.operationId ? { operationId: status.operationId } : {}), bootId: await this.getRuntimeBootId() };
 		}
 		await this.recordEvent("agent.runtime.resume_requested", {
-			mechanism: "Pi Durable pending operation; prompt was not resubmitted",
+			mechanism: "Pi still has this run; the prompt was not sent again",
 		}, "info", status.operationId);
 		return { resumed: true, status: "running", operationId: status.operationId, bootId: await this.getRuntimeBootId() };
 	}
@@ -627,6 +651,8 @@ export class PiAgent extends Agent<Env> {
 			selected: selectedExtensions.has(extension.name) && selectedTools.has(tool.name),
 		}));
 		const recentTools = inspectRecentTools(view.entries);
+		const servers = this.mcp.listServers();
+		const serverNames = new Map(servers.map(({ id, name }) => [id, sanitizeToolName(name)]));
 		return {
 			brain: {
 				model: agent.model ? { provider: agent.model.provider, modelId: agent.model.modelId } : null,
@@ -657,13 +683,22 @@ export class PiAgent extends Agent<Env> {
 					...this.computerTools().tools.map(({ name, description }) => ({ group: "workspace", name, description })),
 					{ group: "web", name: "search", description: "Search the live web (createAIWebSearch)." },
 					{ group: "web", name: "fetch", description: "Read one URL as Markdown or raw (fetchWeb)." },
-					...this.mcp.listTools().map((tool) => ({ group: `mcp:${tool.serverId}`, name: tool.name, description: tool.description ?? "No description provided." })),
+					...this.mcp.listTools().map((tool) => ({ group: serverNames.get(tool.serverId) ?? "mcp", name: tool.name, description: tool.description ?? "No description provided." })),
 				],
 				currentCalls: toolCalls(live),
 				recentTools,
 				workspaceFiles,
 				artifactRepos: artifactRepos.map(({ name, description }) => ({ name, ...(description ? { description } : {}) })),
-				mcpServers: this.mcp.listServers().map(({ id, name, server_url }) => ({ id, name, endpoint: safeMcpEndpoint(server_url) })),
+				mcpServers: servers.map(({ id, name, server_url }) => {
+					const connection = this.mcp.mcpConnections[id];
+					return {
+						id,
+						name,
+						endpoint: safeMcpEndpoint(server_url),
+						state: connection?.connectionState ?? "not connected",
+						...(connection?.connectionError ? { error: connection.connectionError } : {}),
+					};
+				}),
 				inspectionErrors,
 				browser: {
 					name: this.browser.name,
@@ -683,8 +718,8 @@ export class PiAgent extends Agent<Env> {
 		const status = await this.getStatus();
 		if (status.status !== "running" || !status.operationId) return { interrupted: false };
 		const details: Record<string, string | number | boolean> = cause === "deadline"
-			? { source: "demo deadline control", action: "PiHarness.abort" }
-			: { source: "demo fault injection", action: "Durable Object context abort", simulation: "abrupt object restart; no real Worker OOM" };
+			? { source: "abort button", action: "PiHarness.abort" }
+			: { source: "restart button", action: "ctx.abort()", note: "restarts the Durable Object; does not use up memory" };
 		await this.recordEvent(cause === "deadline" ? "demo.deadline.fired" : "demo.runtime.restart_requested", details, "warn", status.operationId);
 		if (cause === "runtime-crash") {
 			this.ctx.abort("Demo: simulate abrupt Durable Object restart", { retryAlarm: true });
@@ -715,7 +750,14 @@ export class PiAgent extends Agent<Env> {
 			return;
 		}
 		const interrupted = await this.piHarness.abort({ operationId: payload.operationId });
-		await this.recordEvent("demo.deadline.fired", { source: "durable Agent schedule", interrupted }, "warn", payload.operationId);
+		await this.recordEvent("demo.deadline.fired", { source: "scheduled abort", interrupted }, "warn", payload.operationId);
+	}
+
+	/** Records how a run ended, only if the status still shows that run as running, so it is recorded once. */
+	private async finishRun(operationId: string, update: { status: "complete"; lastResponse: string } | { status: "failed"; lastError: string }): Promise<void> {
+		const status = await this.ctx.storage.get<AgentStatus>("agent:status");
+		if (status?.status !== "running" || status.operationId !== operationId) return;
+		await this.saveStatus(update);
 	}
 
 	private async saveStatus(update: Partial<AgentStatus> & Pick<AgentStatus, "status">): Promise<void> {
@@ -765,7 +807,7 @@ function send(connection: Connection, message: unknown): void {
 	}
 }
 
-/** Pi renders state, not events: the Event Lab gets a compact copy of the conversation view on every change. */
+/** The trimmed conversation state the Event Lab gets on every change. */
 function projectView(view: ConversationView): ConversationSnapshot {
 	const live = (view.docs["pi.live"] ?? {}) as LiveState;
 	const message = live.generation?.message;
@@ -861,6 +903,10 @@ function inspectRecentTools(entries: readonly EntryRecord[]): AgentInspection["h
 		}
 	}
 	return calls.slice(-12).map(({ id, item }) => ({ ...item, ...(id && results.has(id) ? results.get(id) : {}) }));
+}
+
+function unansweredMessage(reason: string | undefined): string {
+	return `Pi Durable run ended unanswered: ${reason ?? "unknown reason"}`;
 }
 
 function parseMcpServers(value: string | undefined) {
