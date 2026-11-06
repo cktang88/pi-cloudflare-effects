@@ -5,8 +5,6 @@ const agentStorageKey = "pi-cloudflare-demo-agent";
 let agentId = "";
 let socket;
 const eventRows = new Map();
-let liveMessage;
-const liveTools = new Map();
 let statusTimer;
 let pollController;
 let connectionGeneration = 0;
@@ -103,73 +101,30 @@ function showLiveResponse(text) {
   $("answer").textContent = text || "Waiting for the first response token…";
 }
 
-function receivePiEvents(events) {
-  for (const event of events || []) {
-    const at = new Date().toISOString();
-    if (event.type === "snapshot") {
-      const generation = event.generation;
-      for (const entry of event.history || []) {
-        for (const [index, message] of (entry.messages || []).entries()) {
-          addEvent({ id: `pi-entry-${entry.id}-${index}`, at, type: `Pi ${message.role} · saved trajectory`, details: { entry: entry.kind, content: message.content } });
-        }
-      }
-      for (const call of event.tools || []) {
-        const row = { id: `pi-live-${call.name}`, name: call.name, output: call.output || "" };
-        addEvent({ id: row.id, at, type: `Tool ${row.name} · ${call.status}`, details: row.output ? { output: row.output.slice(-1000) } : {} });
-      }
-      if (generation?.message) {
-        liveMessage = { id: `pi-message-${connectionGeneration}`, role: generation.message.role, content: messageContent(generation.message), preview: messageText(generation.message) };
-        addEvent({ id: liveMessage.id, at, type: `Pi ${liveMessage.role} message · live snapshot`, details: { content: liveMessage.content }, ...(liveMessage.role === "assistant" ? { preview: liveMessage.preview || "Waiting for the first response token…" } : {}) });
-        if (liveMessage.role === "assistant") showLiveResponse(liveMessage.preview);
-      }
-      addEvent({ id: `pi-snapshot-${connectionGeneration}`, at, type: "Pi trajectory attached", details: { state: generation ? "generation in progress" : "waiting for next Pi event" } });
-      continue;
+// Pi Durable renders state, not events: each socket message carries a compact copy of the
+// conversation view. Rows are keyed by entry id or tool slot, so a new view updates them in place.
+function renderPiView(view) {
+  if (!view) return;
+  const at = new Date().toISOString();
+  for (const entry of view.entries || []) {
+    for (const [index, message] of (entry.messages || []).entries()) {
+      addEvent({ id: `pi-entry-${entry.id}-${index}`, at, type: `Pi ${message.role} · ${entry.kind}`, details: { content: message.content } });
     }
-    if (event.type === "message_start") {
-      liveMessage = { id: `pi-message-${crypto.randomUUID()}`, role: event.message.role, content: messageContent(event.message), preview: messageText(event.message) };
-      addEvent({ id: liveMessage.id, at, type: `Pi ${liveMessage.role} message · streaming`, details: { content: liveMessage.content }, ...(liveMessage.role === "assistant" ? { preview: liveMessage.preview || "Waiting for the first response token…" } : {}) });
-      if (liveMessage.role === "assistant") showLiveResponse(liveMessage.preview);
-      continue;
-    }
-    if (event.type === "message_update" && liveMessage) {
-      for (const change of event.changes || []) {
-        if (change.type === "text_delta") liveMessage.content += change.delta;
-        else if (change.type === "text_start" && change.block?.text) liveMessage.content += change.block.text;
-        else if (change.type === "toolcall_delta") liveMessage.content += change.delta;
-        else if (change.type === "block") liveMessage.content += messageContent({ content: [change.block] });
-        if (liveMessage.role === "assistant") {
-          if (change.type === "text_delta") liveMessage.preview += change.delta;
-          else if (change.type === "text_start" && change.block?.text) liveMessage.preview += change.block.text;
-          else if (change.type === "block") liveMessage.preview += messageText({ content: [change.block] });
-        }
-      }
-      liveMessage.content = liveMessage.content.slice(-8000);
-      liveMessage.preview = liveMessage.preview.slice(-8000);
-      addEvent({ id: liveMessage.id, at, type: `Pi ${liveMessage.role} message · streaming`, details: { content: liveMessage.content }, ...(liveMessage.role === "assistant" ? { preview: liveMessage.preview || "Waiting for the first response token…" } : {}) });
-      if (liveMessage.role === "assistant") showLiveResponse(liveMessage.preview);
-      continue;
-    }
-    if (event.type === "tool_execution_start") {
-      const row = { id: `pi-tool-${event.toolCallId}`, name: event.toolName, output: "" };
-      liveTools.set(event.toolCallId, row);
-      addEvent({ id: row.id, at, type: `Tool ${row.name} · running`, details: { input: event.args } });
-      continue;
-    }
-    if (event.type === "tool_execution_update") {
-      const row = liveTools.get(event.toolCallId);
-      if (!row) continue;
-      if (event.output && "set" in event.output) row.output = event.output.set;
-      else if (event.output) row.output = `${row.output.slice(event.output.trimStart || 0)}${event.output.append || ""}`;
-      addEvent({ id: row.id, at, type: `Tool ${row.name} · running`, details: { output: row.output.slice(-5000), ...(event.details === undefined ? {} : { details: event.details }) } });
-      continue;
-    }
-    if (event.type === "tool_execution_end") {
-      const row = liveTools.get(event.toolCallId);
-      if (row) addEvent({ id: row.id, at, type: `Tool ${row.name} · complete`, details: { output: row.output.slice(-5000) } });
-      continue;
-    }
-    addEvent({ id: `pi-event-${crypto.randomUUID()}`, at, type: `Pi ${event.type}`, details: event });
   }
+  const streamingId = `pi-streaming-${connectionGeneration}`;
+  if (view.streaming) {
+    const { role, content, text } = view.streaming;
+    addEvent({ id: streamingId, at, type: `Pi ${role} message · streaming`, details: { content }, ...(role === "assistant" ? { preview: text || "Waiting for the first response token…" } : {}) });
+    if (role === "assistant") showLiveResponse(text);
+  } else if (eventRows.has(streamingId)) {
+    addEvent({ id: streamingId, at, type: "Pi assistant message · saved to transcript", details: {}, preview: "" });
+  }
+  for (const [index, call] of (view.tools || []).entries()) {
+    addEvent({ id: `pi-tool-${connectionGeneration}-${call.nested ? "nested-" : ""}${index}-${call.name}`, at, type: `Tool ${call.nested ? "(nested) " : ""}${call.name} · ${call.status}`, details: call.output ? { output: call.output.slice(-1000) } : {} });
+  }
+  if (view.retry) addEvent({ id: `pi-retry-${view.retry.at}`, at, type: "Pi model request · retry scheduled", level: "warn", details: { at: new Date(view.retry.at).toISOString(), error: view.retry.error } });
+  if (view.runFailure) addEvent({ id: `pi-run-failure-${connectionGeneration}-${view.runFailure.reason}`, at, type: `Pi run ended unanswered · ${view.runFailure.reason}`, level: "warn", details: view.runFailure.detail ? { detail: view.runFailure.detail } : {} });
+  addEvent({ id: `pi-view-${connectionGeneration}`, at, type: "Pi conversation view attached", details: { state: view.running ? `run in progress · ${view.turns ?? 0} tool round(s)` : "idle", inbox: (view.inbox || []).length } });
 }
 
 function setSocketState(state) { $("socket").textContent = `viewer: ${state}`; }
@@ -236,12 +191,13 @@ function renderInspection(data) {
   addStateCard(extra, "Provider", brain.model?.provider || "none");
   addStateCard(extra, "Thinking", brain.thinkingLevel || "default");
   addStateCard(extra, "Session detail", (brain.sessions || []).map((s) => `${s.id}${s.parent ? ` · child of ${s.parent}` : " · root"}${s.busy ? " · busy" : ""}`).join("\n") || "none");
-  addStateCard(extra, "Compaction", (brain.live?.compactions || []).map((item) => `${item.status || item.reason || "active"}`).join(", ") || "none active");
+  addStateCard(extra, "Compaction", (brain.live?.compactions || []).map((item) => `${item.trigger}${item.blocking ? " · blocking" : ""} · attempt ${item.attempt}`).join(", ") || (brain.live?.compactionFailure ? `last failed: ${brain.live.compactionFailure.error}` : "none active"));
   addStateCard(extra, "Pending submissions", (brain.pending || []).map((p) => `${p.status} · ${p.operationId}`).join("\n") || "none");
   addStateCard(extra, "Extensions", Array.isArray(brain.extensions) ? (brain.extensions.join(", ") || "host defaults") : JSON.stringify(brain.extensions));
   addStateCard(extra, "Usage", JSON.stringify(brain.usage || {}));
   const generation = brain.live?.generation;
   addStateCard(extra, "Generation", generation ? `attempt ${generation.attempt}${generation.retry ? ` · retry ${generation.retry.at}` : ""}${generation.deferred ? ` · deferred until ${generation.deferred.pollAt}` : ""}` : "idle");
+  addStateCard(extra, "Run", brain.live?.run ? `${brain.live.run.turns} tool round(s)` : brain.live?.runFailure ? `last run unanswered · ${brain.live.runFailure.reason}${brain.live.runFailure.detail ? ` · ${brain.live.runFailure.detail}` : ""}` : "idle");
   addStateCard(extra, "Inbox", (brain.live?.inbox || []).length ? `${brain.live.inbox.length} queued item(s)` : "empty");
   $("instructions").textContent = brain.instructions || "No base instructions are configured.";
   const tasks = $("durable-tasks"); tasks.replaceChildren();
@@ -252,7 +208,7 @@ function renderInspection(data) {
   $("task-group").dataset.count = String(liveTasks.length);
   for (const task of liveTasks) {
     const row = document.createElement("div"); row.className = "list-row";
-    const title = document.createElement("strong"); title.textContent = `${task.status} · ${task.phase}`;
+    const title = document.createElement("strong"); title.textContent = `${task.kind} · ${task.status}`;
     const detail = document.createElement("span"); detail.className = "detail"; detail.textContent = `task ${task.id} · conversation ${task.conversationId}${task.owner ? ` · owner task ${task.owner}` : ""}${task.background ? " · background" : ""}${task.abortRequested ? " · abort requested" : ""}`;
     row.append(title, detail); tasks.append(row);
   }
@@ -326,16 +282,16 @@ function renderInspection(data) {
   }
   if (!mcp.childElementCount) mcp.innerHTML = '<div class="empty">No MCP servers are configured on this agent.</div>';
   const browser = data.hands?.browser || {}, browserState = $("browser-state"); browserState.replaceChildren();
-  addStateCard(browserState, "Promoted session", browser.session?.sessionId || "none · dynamic sessions only appear here when shared");
-  addStateCard(browserState, "Open targets", (browser.session?.targets || []).map((target) => target.title || target.url || target.type || target.id).join("\n") || "none");
+  addStateCard(browserState, "Browser", `${browser.name || "browser"} · persistent across turns; each conversation has its own tab`);
   const browserRuns = $("browser-runs"); browserRuns.replaceChildren();
-  for (const item of browser.executions || []) {
+  for (const item of browser.recentCalls || []) {
     const row = document.createElement("div"); row.className = "list-row";
-    const title = document.createElement("strong"); title.textContent = `${item.status} · ${item.id}`;
-    const code = document.createElement("pre"); code.textContent = item.error || item.code;
-    row.append(title, code); browserRuns.append(row);
+    const title = document.createElement("strong"); title.textContent = item.isError ? "browser · error" : "browser"; row.append(title);
+    if (item.arguments) { const code = document.createElement("pre"); code.textContent = item.arguments; row.append(code); }
+    if (item.result) { const result = document.createElement("pre"); result.textContent = item.result; row.append(result); }
+    browserRuns.append(row);
   }
-  if (!browserRuns.childElementCount) browserRuns.innerHTML = '<div class="empty">No browser Code Mode executions have been recorded.</div>';
+  if (!browserRuns.childElementCount) browserRuns.innerHTML = '<div class="empty">No browser tool calls in the saved transcript yet.</div>';
   const sandbox = data.hands?.sandbox || {};
   const sandboxState = $("sandbox-state"); sandboxState.replaceChildren();
   addStateCard(sandboxState, "Container", sandbox.containerRunning ? "running" : "stopped");
@@ -343,7 +299,7 @@ function renderInspection(data) {
   const calls = $("calls"); calls.replaceChildren();
   for (const call of data.hands?.currentCalls || []) {
     const row = document.createElement("div"); row.className = "list-row";
-    const title = document.createElement("strong"); title.textContent = `${call.name} · ${call.status}`; row.append(title);
+    const title = document.createElement("strong"); title.textContent = `${call.nested ? "nested · " : ""}${call.name} · ${call.status}`; row.append(title);
     if (call.output) { const output = document.createElement("pre"); output.textContent = call.output; row.append(output); }
     if (call.diagnostics?.length) { const diagnostics = document.createElement("pre"); diagnostics.textContent = JSON.stringify(call.diagnostics, null, 2); row.append(diagnostics); }
     calls.append(row);
@@ -358,7 +314,7 @@ function renderInspection(data) {
   addStateCard(hands, "Files", String((data.hands?.workspaceFiles || []).length));
   addStateCard(hands, "Tools", String(loadedTools.length + nestedTools.length));
   addStateCard(hands, "Active calls", String((data.hands?.currentCalls || []).length));
-  addStateCard(hands, "Browser", String((browser.executions || []).length));
+  addStateCard(hands, "Browser calls", String((browser.recentCalls || []).length));
 }
 
 async function requestJson(path, options = {}, signal) {
@@ -406,7 +362,7 @@ function connect() {
     if (socket !== nextSocket) return;
     try {
       const event = JSON.parse(message.data);
-      if (event?.type === "pi.trajectory") receivePiEvents(event.events);
+      if (event?.type === "pi.view") renderPiView(event.view);
       else addEvent(event);
     } catch { showError("demo.socket.invalid_event", "Received an event that could not be read."); }
   };
@@ -422,7 +378,7 @@ async function launch() {
   requestBusy = true; $("launch").textContent = "Starting…"; $("new-run").textContent = "Starting…"; updateControls();
   try {
     const result = await requestJson("/agents", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ prompt: $("prompt").value.trim() }) });
-    agentId = result.agentId; currentStatus = "running"; localStorage.setItem(agentStorageKey, agentId); eventRows.clear(); liveMessage = undefined; liveTools.clear(); eventsEl.replaceChildren(); filterEvents();
+    agentId = result.agentId; currentStatus = "running"; localStorage.setItem(agentStorageKey, agentId); eventRows.clear(); eventsEl.replaceChildren(); filterEvents();
     $("answer").textContent = "Waiting for a run to finish.";
     const code = document.createElement("code"); code.textContent = agentId; $("agent-id").replaceChildren(code);
     setStatus({ status: "running", operationId: result.operationId }); connect();

@@ -5,10 +5,6 @@ export interface Env extends Cloudflare.Env {
 	MCP_SERVERS_JSON?: string;
 }
 
-export interface RunInput {
-	prompt: string;
-}
-
 export interface RunResult {
 	agentId: string;
 	text: string;
@@ -39,29 +35,64 @@ export interface AgentEvent {
 
 export type DemoInterrupt = "deadline" | "runtime-crash";
 
+export interface TranscriptItem {
+	id: string;
+	kind: string;
+	messages: Array<{ role: string; content: string }>;
+}
+
+export interface ToolCallView {
+	name: string;
+	status: string;
+	nested?: boolean;
+	output?: string;
+	diagnostics?: unknown[];
+}
+
+/** A compact projection of Pi's conversation view, sent to the Event Lab over its WebSocket. */
+export interface ConversationSnapshot {
+	entries: TranscriptItem[];
+	running: boolean;
+	turns?: number;
+	streaming?: { role: string; content: string; text: string };
+	retry?: { at: number; error: string };
+	tools: ToolCallView[];
+	runFailure?: { reason: string; detail?: string };
+	compactions: unknown[];
+	inbox: unknown[];
+	usage?: unknown;
+}
+
 export interface AgentInspection {
 	brain: {
 		model: { provider: string; modelId: string } | null;
 		thinkingLevel: string | null;
-		extensions: unknown;
+		extensions: string[];
 		instructions: string;
 		usage: unknown;
 		sessions: Array<{ id: string; parent?: string; busy: boolean }>;
-		tasks: Array<{ id: string; kind: string; conversationId: string; owner?: string; status: string; phase: string; background: boolean; abortRequested: boolean }>;
+		tasks: Array<{ id: string; kind: string; conversationId: string; owner?: string; status: string; background: boolean; abortRequested: boolean }>;
 		pending: Array<{ operationId: string; session: string; status: string }>;
-		transcript: Array<{ id: string; kind: string; messages: Array<{ role: string; content: string }> }>;
-		live: { generation: unknown; inbox: readonly unknown[]; compactions: readonly unknown[] };
+		transcript: TranscriptItem[];
+		live: {
+			generation: { attempt: number; retry?: { at: number; error: string }; deferred?: { pollAt: number } } | null;
+			run: { turns: number } | null;
+			runFailure: { reason: string; detail?: string } | null;
+			compactionFailure: unknown;
+			inbox: readonly unknown[];
+			compactions: readonly unknown[];
+		};
 	};
 	hands: {
 		loadedTools: Array<{ extension: string; name: string; replay: string; executionMode: string; selected: boolean }>;
 		nestedTools: Array<{ group: string; name: string; description: string }>;
-		currentCalls: Array<{ name: string; status: string; output?: string; diagnostics?: unknown[] }>;
+		currentCalls: ToolCallView[];
 		recentTools: Array<{ name: string; arguments?: string; result?: string; isError?: boolean }>;
 		workspaceFiles: Array<{ path: string; type: "file" | "dir" }>;
 		artifactRepos: Array<{ name: string; description?: string }>;
 		mcpServers: Array<{ id: string; name: string; endpoint: string }>;
 		inspectionErrors: string[];
-		browser: { executions: Array<{ id: string; status: string; code: string; error?: string }>; session: { sessionId: string; targets: Array<{ id: string; type?: string; url?: string; title?: string }> } | null };
+		browser: { name: string; recentCalls: Array<{ arguments?: string; result?: string; isError?: boolean }> };
 		sandbox: { containerRunning: boolean; snapshotAvailable: boolean; snapshotName?: string; snapshotSize?: number };
 	};
 }

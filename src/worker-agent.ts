@@ -1,47 +1,71 @@
 import { Workspace } from "@cloudflare/computer";
-import { createGitClient } from "@cloudflare/computer/git";
 import { WorkerShellBackend } from "@cloudflare/computer/backends/worker-shell";
-import { createAITools } from "@cloudflare/computer/tools";
-import { createPiTools } from "@cloudflare/computer/tools/pi-ai";
+import { createGitClient } from "@cloudflare/computer/git";
+import { createCloudflareObserver } from "@cloudflare/computer/observe/cloudflare";
+import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
+import { createPiTools, type CreatePiToolsResult } from "@cloudflare/computer/tools/pi-ai";
 import { DynamicWorkerExecutor } from "@cloudflare/codemode";
 import { createCodeTool } from "@cloudflare/codemode/ai";
-import { createModels } from "@earendil-works/pi-ai/models";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { Type } from "@earendil-works/pi-ai";
-import { configure, createRegistry, defineExtension, defineTool, Harness, section, type EntryRecord, type SnapshotEvent, type ToolRegistration } from "@earendil-works/pi-durable";
-import { Agent as DurableAgent, type AgentContext, type Connection } from "agents";
+import { createModels } from "@earendil-works/pi-ai/models";
+import {
+	AssistantEntry,
+	configure,
+	defineExtension,
+	defineTool,
+	Harness,
+	section,
+	createRegistry,
+	type AgentState,
+	type ConversationView,
+	type EntryRecord,
+	type Extension,
+	type LiveState,
+	type Report,
+	type ToolRegistration,
+} from "@earendil-works/pi-durable";
+import { obj, str } from "@earendil-works/pi-schema";
+import { Agent, type AgentContext, type Connection } from "agents";
+import { Browser, browserRun } from "agents/browser";
+import { browserTool } from "agents/browser/pi";
 import { PiHarness, type PiHarnessContext } from "agents/harness/pi";
-import { createBrowserRuntime } from "agents/browser/ai";
 import { createAI } from "agents/models/pi-ai";
-import { tool } from "ai";
-import { Effect } from "effect";
-import { z } from "zod";
-import { withCloudflareSpan, withObservability } from "./observability";
-import type { AgentEvent, AgentInspection, AgentStatus, DemoInterrupt, Env } from "./types";
+import { webFetchTool as webFetchAiTool } from "agents/webfetch/ai-sdk";
+import { webFetchTool } from "agents/webfetch/pi";
+import { webSearchTool as webSearchAiTool } from "agents/websearch/ai-sdk";
+import { webSearchTool } from "agents/websearch/pi";
+import { tracing } from "cloudflare:workers";
+import { errorMessage, traced } from "./observability";
+import { decodeMcpServers } from "./schemas";
+import type { AgentEvent, AgentInspection, AgentStatus, ConversationSnapshot, DemoInterrupt, Env, ToolCallView, TranscriptItem } from "./types";
 
 const DEFAULT_MODEL = "@cf/zai-org/glm-5.3-flash";
 const CORE_EXTENSION = "cloudflare-agent-tools";
 const SUBAGENT_EXTENSION = "durable-subagents";
-const SYSTEM_PROMPT = `You are a careful, resourceful agent running on Pi Durable. Your conversation, tasks, and submissions are durable and resumable. You have a persistent workspace, a resumable Linux sandbox, web search, browser access, and connected MCP tools. Use code_mode to combine short multi-step tool work. Keep durable facts that will help future runs in /memory.md in the workspace. Work in small verified steps, and report important actions and errors clearly.`;
+const SYSTEM_PROMPT = `You are a careful, resourceful agent running on Pi Durable. Your conversation, tasks, and submissions are durable and resumable. You have a persistent workspace, a resumable Linux sandbox, web search and fetch, a persistent browser, and connected MCP tools. Use code_mode to combine short multi-step workspace, web, and MCP work in one script. Keep durable facts that will help future runs in /memory.md in the workspace. Work in small verified steps, and report important actions and errors clearly.`;
 
-type AiTool = {
-	description?: string;
-	inputSchema: z.ZodType;
-	execute?: (args: Record<string, unknown>, options: { toolCallId: string; messages: [] }) => Promise<unknown>;
-};
+const Delegate = obj({ task: str({ minLength: 1, maxLength: 8_000, description: "A self-contained task for the subagent." }) });
+const GenerateImage = obj({
+	modelId: str({ minLength: 1, maxLength: 200, description: "Workers AI image model id, such as @cf/black-forest-labs/flux-1-schnell." }),
+	prompt: str({ minLength: 1, maxLength: 4_000 }),
+});
+const ContainerExec = obj({ command: str({ minLength: 1, maxLength: 16_384 }) });
+const CodeMode = obj({ code: str({ minLength: 1, description: "An async arrow function that calls the workspace, web, and mcp tool groups." }) });
 
-export class PiAgent extends DurableAgent<Env> {
+export class PiAgent extends Agent<Env> {
 	private mcpServersAdded = false;
 	private nestedToolGroups: AgentInspection["hands"]["nestedTools"] = [];
-	private browserRuntime?: ReturnType<typeof createBrowserRuntime>;
-	private trajectoryStreams = new Map<string, { stop: () => Promise<unknown> }>();
+	private readonly trajectoryWatches = new Map<string, { stop: () => Promise<unknown> }>();
 	readonly ai = createAI({ binding: this.env.AI });
+	/** One registry per object: Pi keeps each Harness subscribed to it until the Harness closes. */
 	readonly registry = createRegistry();
+	readonly browser = new Browser({ provider: browserRun(this.env.BROWSER) });
 	readonly workspace = new Workspace({
-		storage: this.ctx.storage as unknown as import("@cloudflare/computer").DurableObjectStorageLike,
+		storage: this.ctx.storage,
 		artifacts: { binding: this.env.ARTIFACTS, sessionId: this.ctx.id.toString() },
 		git: createGitClient(),
 		defaultGitIdentity: { name: "Pi Agent", email: "pi-agent@invalid.local" },
+		observer: createCloudflareObserver({ tracing }),
 		backends: [
 			new WorkerShellBackend({
 				id: "shell",
@@ -51,20 +75,20 @@ export class PiAgent extends DurableAgent<Env> {
 			}),
 		],
 	});
-	readonly piHarness: PiHarness;
+	readonly piHarness = new PiHarness({
+		harness: (context) => this.openPi(context),
+		defaults: { model: this.ai(this.env.MODEL_ID ?? DEFAULT_MODEL) },
+	});
 
 	constructor(ctx: AgentContext, env: Env) {
 		super(ctx, env);
-		this.piHarness = new PiHarness({
-			harness: (context) => this.createRuntime(context),
-			defaults: { model: this.ai(this.env.MODEL_ID ?? DEFAULT_MODEL) },
-		});
-		this.lifecycle.use(this.piHarness);
+		this.lifecycle.use(this.browser).use(this.piHarness);
 	}
 
 	async onStart(): Promise<void> {
 		const previousBootId = await this.ctx.storage.get<string>("agent:boot-id");
-		await this.ctx.storage.put("agent:boot-id", crypto.randomUUID());
+		const bootId = crypto.randomUUID();
+		await this.ctx.storage.put("agent:boot-id", bootId);
 		const status = await this.ctx.storage.get<AgentStatus>("agent:status");
 		if (!status) {
 			await this.saveStatus({ status: "idle" });
@@ -75,8 +99,8 @@ export class PiAgent extends DurableAgent<Env> {
 			if (pending.some((operation) => operation.operationId === status.operationId)) {
 				await this.recordEvent("agent.runtime.recovered", {
 					previousBootId,
-					bootId: await this.ctx.storage.get<string>("agent:boot-id") ?? "unknown",
-					mechanism: "Pi Durable restored persisted session tasks",
+					bootId,
+					mechanism: "PiHarness reopened Pi Durable and resumed its stored tasks",
 				}, "info", status.operationId);
 			}
 		}
@@ -85,19 +109,17 @@ export class PiAgent extends DurableAgent<Env> {
 	async onConnect(connection: Connection): Promise<void> {
 		for (const event of await this.getEvents()) connection.send(JSON.stringify(event));
 		await this.recordEvent("client.connected", { connectionId: connection.id });
-		const stream = await this.piHarness.session().events();
-		const snapshot = compactTrajectorySnapshot(stream.snapshot);
-		connection.send(JSON.stringify({ type: "pi.trajectory", events: [snapshot] }));
-		stream.start(async (events) => {
+		const watch = await this.piHarness.session().watch();
+		connection.send(JSON.stringify({ type: "pi.view", view: projectView(watch.value) }));
+		watch.start(async (call) => {
+			if (call.kind !== "value") return;
 			try {
-				connection.send(JSON.stringify({ type: "pi.trajectory", events: events.map((event) => event.type === "snapshot" ? compactTrajectorySnapshot(event) : event) }));
+				connection.send(JSON.stringify({ type: "pi.view", view: projectView(call.value) }));
 			} catch (error) {
-				await this.recordEvent("agent.trajectory.stream.error", {
-					message: error instanceof Error ? error.message : String(error),
-				}, "warn");
+				await this.recordEvent("agent.trajectory.stream.error", { message: errorMessage(error) }, "warn");
 			}
 		});
-		this.trajectoryStreams.set(connection.id, { stop: () => stream.stop() });
+		this.trajectoryWatches.set(connection.id, watch);
 	}
 
 	async onMessage(connection: Connection, message: string | ArrayBuffer): Promise<void> {
@@ -105,9 +127,7 @@ export class PiAgent extends DurableAgent<Env> {
 	}
 
 	async onClose(connection: Connection, code: number, reason: string, wasClean: boolean): Promise<void> {
-		const stream = this.trajectoryStreams.get(connection.id);
-		this.trajectoryStreams.delete(connection.id);
-		if (stream) await stream.stop();
+		await this.stopWatch(connection.id);
 		await this.recordEvent("client.disconnected", {
 			connectionId: connection.id,
 			code,
@@ -118,15 +138,172 @@ export class PiAgent extends DurableAgent<Env> {
 
 	async onError(connectionOrError: Connection | unknown, error?: unknown): Promise<void> {
 		if (typeof connectionOrError === "object" && connectionOrError !== null && "id" in connectionOrError) {
-			const connection = connectionOrError as Connection;
-			const stream = this.trajectoryStreams.get(connection.id);
-			this.trajectoryStreams.delete(connection.id);
-			if (stream) await stream.stop();
+			await this.stopWatch((connectionOrError as Connection).id);
 		}
-		const cause = error ?? connectionOrError;
-		await this.recordEvent("agent.websocket.error", {
-			message: cause instanceof Error ? cause.message : String(cause),
-		}, "error");
+		await this.recordEvent("agent.websocket.error", { message: errorMessage(error ?? connectionOrError) }, "error");
+	}
+
+	async run(prompt: string): Promise<{ text: string }> {
+		const operationId = crypto.randomUUID();
+		try {
+			return await traced("agent.run", { "agent.id": this.name, "agent.operation_id": operationId }, async () => {
+				await this.saveStatus({ status: "running", operationId });
+				const result = await this.piHarness.prompt(prompt, { operationId });
+				if (result.status !== "done") throw new Error(`Pi Durable run ended unanswered: ${result.reason ?? "unknown reason"}`);
+				const text = result.text ?? "";
+				await this.saveSandbox();
+				await this.saveStatus({ status: "complete", lastResponse: text });
+				return { text };
+			});
+		} catch (error) {
+			try {
+				await this.saveSandbox();
+			} catch (snapshotError) {
+				console.error(JSON.stringify({ event: "sandbox.snapshot.failed", agentId: this.name, error: errorMessage(snapshotError) }));
+			}
+			await this.saveStatus({ status: "failed", lastError: errorMessage(error) });
+			throw error;
+		}
+	}
+
+	async launch(prompt: string): Promise<{ operationId: string }> {
+		const operationId = crypto.randomUUID();
+		return traced("agent.launch", { "agent.id": this.name, "agent.operation_id": operationId }, async () => {
+			await this.saveStatus({ status: "running", operationId });
+			try {
+				await this.piHarness.submit(prompt, { operationId });
+			} catch (error) {
+				await this.saveStatus({ status: "failed", lastError: errorMessage(error) });
+				throw error;
+			}
+			return { operationId };
+		});
+	}
+
+	/**
+	 * PiHarness's factory. It can run more than once (after a storage error), so it
+	 * only installs extensions by name, which replaces them in place.
+	 */
+	private async openPi({ storage, context, onWake }: PiHarnessContext): Promise<Harness> {
+		await this.connectMcpServers();
+		await this.mcp.waitForConnections({ timeout: 10_000 });
+		const models = createModels();
+		models.setProvider(this.ai.provider);
+		const core = this.coreExtension();
+		const subagents: Extension = defineExtension({
+			name: SUBAGENT_EXTENSION,
+			tools: [defineTool({
+				name: "delegate",
+				description: "Launch a durable subagent for a focused task and return its answer.",
+				parameters: Delegate,
+				// A rerun after an eviction finds the same child conversation and submission.
+				replay: "safe",
+				execute: async ({ task }, api, context) => {
+					const childId = await api.commit(async (tx) => {
+						const existing = (await tx.scanConversations({ ownerTaskId: api.taskId }, 1)).items[0];
+						if (existing !== undefined) return existing.id;
+						// A task-owned conversation starts as a copy of this one's agent; it gets no subagents of its own.
+						const created = await tx.createConversation({ ownership: { kind: "task", taskId: api.taskId } });
+						await configure(tx, created.id, { extensions: { remove: [subagents] } });
+						return created.id;
+					}, context);
+					await api.details({ conversationId: String(childId) }, context);
+					const child = await api.conversation(childId, context);
+					if (!child) throw new Error("Pi Durable child conversation was not created");
+					const submission = await child.submit({ type: "input", content: task, requestId: `delegate:${api.taskId}` }, context);
+					const settled = await submission.wait(context);
+					if (settled.status !== "done" || settled.type !== "input") throw new Error(`Subagent ended unanswered: ${settled.status === "unanswered" ? settled.reason : "no answer"}`);
+					const entry = await api.commit((tx) => tx.entry(AssistantEntry, settled.answer), context);
+					return { output: [{ type: "text", text: assistantEntryText(entry) }] };
+				},
+			})],
+		});
+		this.registry.install(core);
+		this.registry.install(subagents);
+		return Harness.open(storage, { models, registry: this.registry, onWake, onReport: (report) => this.report(report) }, context);
+	}
+
+	private coreExtension(): Extension {
+		const computer = createAITools({
+			workspace: this.workspace,
+			exec: { backends: { shell: { description: "Persistent workspace files and Artifacts Git repositories." } } },
+		});
+		const web = {
+			search: webSearchAiTool({ binding: this.env.AI, gateway: this.env.AI_GATEWAY_ID ?? "default" }),
+			fetch: webFetchAiTool({ binding: this.env.AI }),
+		};
+		const mcp = this.mcp.getAITools();
+		this.nestedToolGroups = [
+			...describeToolSet("workspace", computer),
+			...describeToolSet("web", web),
+			...describeToolSet("mcp", mcp),
+		];
+		const codeTool = createCodeTool({
+			tools: [
+				{ name: "workspace", tools: computer },
+				{ name: "web", tools: web },
+				{ name: "mcp", tools: mcp },
+			],
+			executor: new DynamicWorkerExecutor({ loader: this.env.LOADER }),
+		});
+		const codeMode: ToolRegistration<typeof CodeMode> = {
+			name: "code_mode",
+			description: typeof codeTool.description === "string" ? codeTool.description : "Run code that calls the workspace, web, and mcp tool groups.",
+			parameters: CodeMode,
+			execute: async ({ code }, api, context) => {
+				const result = await traced("agent.tool.code_mode", { "agent.tool.name": "code_mode" }, async () => {
+					const output = codeTool.execute!({ code }, { toolCallId: String(api.taskId), messages: [], abortSignal: context.abortSignal, context: {} });
+					if (!(Symbol.asyncIterator in Object(output))) return await output;
+					let final: unknown;
+					for await (const part of output as AsyncIterable<unknown>) final = part;
+					return final;
+				});
+				return { output: [{ type: "text", text: JSON.stringify(result) }] };
+			},
+		};
+		const generateImage: ToolRegistration<typeof GenerateImage> = {
+			name: "generate_image",
+			description: "Generate an image with a Workers AI image model and return it in the conversation.",
+			parameters: GenerateImage,
+			execute: async ({ modelId, prompt }) => traced("agent.tool.generate_image", { "agent.tool.name": "generate_image" }, async () => {
+				const result = await this.ai.generateImages(this.ai.images(modelId), { input: [{ type: "text", text: prompt }] });
+				if (result.stopReason === "error") throw new Error(result.errorMessage ?? "Image generation failed");
+				return { output: result.output, ...(result.usage ? { usage: result.usage } : {}) };
+			}),
+		};
+		const containerExec: ToolRegistration<typeof ContainerExec> = {
+			name: "container_exec",
+			description: "Run a command in this agent's resumable Linux sandbox. Its filesystem is separate from the durable workspace.",
+			parameters: ContainerExec,
+			executionMode: "sequential",
+			execute: async ({ command }) => ({
+				output: [{ type: "text", text: await traced("agent.tool.container_exec", { "agent.tool.name": "container_exec" }, () => this.runInContainer(command)) }],
+			}),
+		};
+		return defineExtension({
+			name: CORE_EXTENSION,
+			sections: [section("preamble", () => SYSTEM_PROMPT, { tag: false })],
+			tools: [
+				...workspaceTools(createPiTools({ workspace: this.workspace, readonly: true })),
+				webSearchTool({ binding: this.env.AI, gateway: this.env.AI_GATEWAY_ID ?? "default" }),
+				webFetchTool({ binding: this.env.AI }),
+				browserTool({ browser: this.browser, loader: this.env.LOADER }),
+				codeMode,
+				generateImage,
+				containerExec,
+			],
+		});
+	}
+
+	private report(report: Report): void {
+		console.error(JSON.stringify({
+			event: "pi.report",
+			agentId: this.name,
+			kind: report.kind,
+			...("reason" in report && report.reason ? { reason: report.reason } : {}),
+			...("task" in report && report.task ? { taskId: String(report.task.id), taskKind: report.task.kind } : {}),
+			error: errorMessage(report.error),
+		}));
 	}
 
 	private async connectMcpServers(): Promise<void> {
@@ -137,141 +314,10 @@ export class PiAgent extends DurableAgent<Env> {
 		this.mcpServersAdded = true;
 	}
 
-	async run(prompt: string): Promise<{ text: string }> {
-		const program = Effect.tryPromise({
-			try: async () => {
-				const operationId = crypto.randomUUID();
-				await this.saveStatus({ status: "running", operationId });
-				const result = await this.piHarness.prompt(prompt, { operationId });
-				if (result.status !== "done") throw new Error(result.reason ?? "Pi Durable conversation did not complete");
-				const text = result.text ?? "";
-				await this.saveSandbox();
-				await this.saveStatus({ status: "complete", lastResponse: text });
-				return { text };
-			},
-			catch: (cause) => new Error("Pi Durable run failed", { cause }),
-		}).pipe(
-			Effect.withSpan("agent.run", { attributes: { agentId: this.ctx.id.toString() } }),
-			withObservability,
-		);
-		try {
-			return await withCloudflareSpan("agent.run", { "agent.id": this.name }, () => Effect.runPromise(program));
-		} catch (error) {
-			try {
-				await this.saveSandbox();
-			} catch (snapshotError) {
-				console.error(JSON.stringify({ event: "sandbox.snapshot.failed", agentId: this.ctx.id.toString(), error: snapshotError instanceof Error ? snapshotError.message : String(snapshotError) }));
-			}
-			await this.saveStatus({ status: "failed", lastError: error instanceof Error ? error.message : String(error) });
-			throw error;
-		}
-	}
-
-	async launch(prompt: string): Promise<{ operationId: string }> {
-		return withCloudflareSpan("agent.launch", { "agent.id": this.name }, async () => {
-			const operationId = crypto.randomUUID();
-			await this.saveStatus({ status: "running", operationId });
-			try {
-				await this.piHarness.submit(prompt, { operationId });
-			} catch (error) {
-				await this.saveStatus({ status: "failed", lastError: error instanceof Error ? error.message : String(error) });
-				throw error;
-			}
-			return { operationId };
-		});
-	}
-
-	private async createRuntime({ storage, context }: PiHarnessContext): Promise<Harness> {
-		await this.connectMcpServers();
-		await this.mcp.waitForConnections({ timeout: 10_000 });
-		const models = createModels();
-		models.setProvider(this.ai.provider);
-		const computerTools = createAITools({ workspace: this.workspace, shell: {
-			defaultBackend: "shell",
-			backends: { shell: { description: "Persistent workspace files and Artifacts Git repositories." } },
-		} });
-		this.browserRuntime = createBrowserRuntime({ ctx: this.ctx, browser: this.env.BROWSER, loader: this.env.LOADER, session: { mode: "dynamic" } });
-		const browserTools = this.browserRuntime.tools;
-		const mcpTools = this.mcp.getAITools();
-		const webSearch = tool({
-			description: "Search the live web for current facts and sources.",
-			inputSchema: z.object({ query: z.string().min(1).max(1024), limit: z.number().int().min(1).max(10).optional() }),
-			execute: async ({ query, limit }) => {
-				const response = await this.env.AI.websearch({ gatewayId: this.env.AI_GATEWAY_ID ?? "default", query, limit: limit ?? 5 });
-				return response.json();
-			},
-		});
-		this.nestedToolGroups = [
-			...describeToolSet("workspace", computerTools),
-			...describeToolSet("browser", browserTools),
-			...describeToolSet("mcp", mcpTools),
-			{ group: "web", name: "search", description: "Search the live web for current facts and sources." },
-		];
-		const codeMode = createCodeTool({
-			tools: [
-				{ name: "workspace", tools: computerTools },
-				{ name: "browser", tools: browserTools },
-				{ name: "mcp", tools: mcpTools },
-				{ name: "web", tools: { search: webSearch } },
-			],
-			executor: new DynamicWorkerExecutor({ loader: this.env.LOADER }),
-		});
-		const directWorkspace = createPiTools({ workspace: this.workspace, readonly: true });
-		const tools: ToolRegistration[] = [
-			...toPiWorkspaceTools(directWorkspace),
-			...toPiTools({ code_mode: codeMode }),
-			{
-				name: "generate_image",
-				description: "Generate an image with a Workers AI image model and return it in the conversation.",
-				parameters: Type.Object({ modelId: Type.String({ minLength: 1, maxLength: 200 }), prompt: Type.String({ minLength: 1, maxLength: 4_000 }) }),
-				replay: "unsafe",
-				execute: async (args) => traceTool("generate_image", async () => {
-					const { modelId, prompt } = args as { modelId: string; prompt: string };
-					const result = await this.ai.generateImages(this.ai.images(modelId), { input: [{ type: "text", text: prompt }] });
-					if (result.stopReason === "error") throw new Error(result.errorMessage ?? "Image generation failed");
-					return { content: result.output, usage: result.usage };
-				}),
-			},
-			{
-				name: "container_exec",
-				description: "Run a command in this agent's resumable Linux sandbox. Its filesystem is separate from the durable workspace.",
-				parameters: Type.Object({ command: Type.String({ minLength: 1, maxLength: 16_384 }) }),
-				executionMode: "sequential",
-				replay: "unsafe",
-				execute: async (args) => ({ content: [{ type: "text", text: await traceTool("container_exec", () => this.runInContainer((args as { command: string }).command)) }] }),
-			},
-		];
-		const coreExtension = defineExtension({ name: CORE_EXTENSION, tools, sections: [section("preamble", () => SYSTEM_PROMPT, { tag: false })] });
-		const subagentExtension = defineExtension({
-			name: SUBAGENT_EXTENSION,
-			tools: [defineTool({
-				name: "delegate",
-				description: "Launch a durable subagent for a focused task and return its answer.",
-				parameters: Type.Object({ task: Type.String({ minLength: 1, maxLength: 8_000 }) }),
-				replay: "safe",
-				execute: async ({ task }, api, context) => {
-					const childId = await api.commit(async (tx) => {
-						const existing = (await tx.scanConversations({ ownerTaskId: api.taskId }, 1)).items[0];
-						if (existing) return existing.id;
-						const created = await tx.createConversation({
-							ownership: { kind: "task", taskId: api.taskId },
-						});
-						await configure(tx, created.id, { extensions: [coreExtension] });
-						return created.id;
-					}, context);
-					await api.details({ conversationId: childId }, context);
-					const child = await api.conversation(childId, context);
-					if (!child) throw new Error("Pi Durable child conversation was not created");
-					const settled = await (await child.submit({ type: "input", content: task, requestId: `delegate:${api.taskId}` }, context)).wait(context);
-					if (settled.status !== "done") throw new Error(`Subagent failed: ${settled.reason}`);
-					const entry = settled.type === "input" ? await api.commit((tx) => tx.entry(settled.answer), context) : undefined;
-					return { content: [{ type: "text", text: assistantEntryText(entry) }] };
-				},
-			})],
-		});
-		this.registry.install(coreExtension);
-		this.registry.install(subagentExtension);
-		return Harness.open(storage, { models, registry: this.registry }, context);
+	private async stopWatch(connectionId: string): Promise<void> {
+		const watch = this.trajectoryWatches.get(connectionId);
+		this.trajectoryWatches.delete(connectionId);
+		if (watch) await watch.stop();
 	}
 
 	private async runInContainer(command: string): Promise<string> {
@@ -286,7 +332,7 @@ export class PiAgent extends DurableAgent<Env> {
 					? { containerSnapshot: snapshot, instance: "standard-2", enableInternet: true }
 					: { image: "cloudflare/debian-trixie", entrypoint: ["/bin/sleep", "infinity"], instance: "standard-2", enableInternet: true });
 				this.ctx.waitUntil(container.monitor().catch((error: unknown) => {
-					console.error(JSON.stringify({ event: "sandbox.monitor.failed", agentId: this.ctx.id.toString(), error: error instanceof Error ? error.message : String(error) }));
+					console.error(JSON.stringify({ event: "sandbox.monitor.failed", agentId: this.name, error: errorMessage(error) }));
 				}));
 			}
 			const process = await container.exec(["bash", "-lc", command]);
@@ -303,7 +349,7 @@ export class PiAgent extends DurableAgent<Env> {
 			await this.saveSandbox();
 		} catch (snapshotError) {
 			if (commandError === undefined) throw snapshotError;
-			console.error(JSON.stringify({ event: "sandbox.snapshot.failed", agentId: this.ctx.id.toString(), error: snapshotError instanceof Error ? snapshotError.message : String(snapshotError) }));
+			console.error(JSON.stringify({ event: "sandbox.snapshot.failed", agentId: this.name, error: errorMessage(snapshotError) }));
 		}
 		if (commandError !== undefined) throw commandError;
 		return result ?? "";
@@ -328,7 +374,7 @@ export class PiAgent extends DurableAgent<Env> {
 		if (result.status === "done") {
 			await this.saveStatus({ status: "complete", lastResponse: result.text ?? "" });
 		} else {
-			await this.saveStatus({ status: "failed", lastError: result.reason ?? "Pi Durable conversation did not complete" });
+			await this.saveStatus({ status: "failed", lastError: `Pi Durable run ended unanswered: ${result.reason ?? "unknown reason"}` });
 		}
 		return (await this.ctx.storage.get<AgentStatus>("agent:status")) ?? status;
 	}
@@ -347,12 +393,6 @@ export class PiAgent extends DurableAgent<Env> {
 			await this.recordEvent("agent.runtime.nothing_to_resume", { status: status.status }, "info", status.operationId);
 			return { resumed: false, status: status.status, ...(status.operationId ? { operationId: status.operationId } : {}), bootId: await this.getRuntimeBootId() };
 		}
-		const pending = await this.piHarness.pending();
-		if (!pending.some((operation) => operation.operationId === status.operationId)) {
-			const settled = await this.getStatus();
-			await this.recordEvent("agent.runtime.nothing_to_resume", { status: settled.status }, "info", status.operationId);
-			return { resumed: false, status: settled.status, operationId: status.operationId, bootId: await this.getRuntimeBootId() };
-		}
 		await this.recordEvent("agent.runtime.resume_requested", {
 			mechanism: "Pi Durable pending operation; prompt was not resubmitted",
 		}, "info", status.operationId);
@@ -360,98 +400,90 @@ export class PiAgent extends DurableAgent<Env> {
 	}
 
 	async inspectBrainAndHands(): Promise<AgentInspection> {
-		const session = this.piHarness.session();
-		const eventStream = await session.events();
-		const snapshot = eventStream.snapshot;
-		await eventStream.stop();
+		const inspectionErrors: string[] = [];
 		const pi = await this.piHarness.pi();
-		const taskGraph = await pi.taskGraph(BACKGROUND_CONTEXT);
-		const tasks = Object.values(taskGraph.value.tasks).map(({ id, kind, conversationId, owner, state, background, abortRequested }) => ({
+		const [viewWatch, taskGraphWatch] = await Promise.all([
+			this.piHarness.session().watch({ min: 30 }),
+			pi.watchTaskGraph(BACKGROUND_CONTEXT),
+		]);
+		const view = viewWatch.value;
+		const taskGraph = taskGraphWatch.value;
+		await Promise.all([viewWatch.stop(), taskGraphWatch.stop()]);
+		const tasks = Object.values(taskGraph.tasks).map(({ id, kind, conversationId, owner, state, background, abortRequested }) => ({
 			id: String(id),
 			kind,
 			conversationId: String(conversationId),
 			...(owner ? { owner: String(owner) } : {}),
 			status: state.status,
-			phase: "phase" in state ? state.phase : state.outcome,
 			background,
 			abortRequested,
 		}));
-		taskGraph.dispose();
-		const inspectionErrors: string[] = [];
-		const [entries, pending, sessions, workspaceFiles, artifactRepos, browserExecutions, browserSession] = await Promise.all([
-			session.messages(),
+		const [pending, sessions, workspaceFiles, artifactRepos] = await Promise.all([
 			this.piHarness.pending(),
 			this.piHarness.sessions.list(),
 			this.workspace.fs.find("/", undefined, { limit: 100 }),
-			this.workspace.artifacts.list().catch((error: unknown) => { inspectionErrors.push(`Artifacts: ${errorMessage(error)}`); return []; }),
-			(this.browserRuntime?.runtime.executions(10) ?? Promise.resolve([])).catch((error: unknown) => { inspectionErrors.push(`Browser executions: ${errorMessage(error)}`); return []; }),
-			(this.browserRuntime?.connector.sessionInfo() ?? Promise.resolve(undefined)).catch((error: unknown) => { inspectionErrors.push(`Browser session: ${errorMessage(error)}`); return undefined; }),
+			this.workspace.artifacts.list().catch((error: unknown) => {
+				inspectionErrors.push(`Artifacts: ${errorMessage(error).slice(0, 240)}`);
+				return [];
+			}),
 		]);
 		const sandboxSnapshot = await this.ctx.storage.get<ContainerSnapshot>("sandbox:snapshot");
 		const snapshotMetadata = sandboxSnapshot as unknown as { name?: unknown; size?: unknown } | undefined;
+		const agent = (view.docs["pi.agent"] ?? {}) as AgentState;
+		const live = (view.docs["pi.live"] ?? {}) as LiveState;
 		const registry = this.registry.snapshot();
-		const extensionChoice = snapshot.agent.extensions;
+		const extensionChoice = agent.extensions;
 		const defaultExtensions = registry.installed().map((extension) => extension.name);
 		const selectedExtensions = new Set(Array.isArray(extensionChoice)
 			? extensionChoice
 			: [...defaultExtensions, ...(extensionChoice?.add ?? [])].filter((name) => !extensionChoice?.remove?.includes(name)));
-		const toolChoice = snapshot.agent.tools;
+		const toolChoice = agent.tools;
 		const defaultTools = registry.tools().filter(({ extension }) => selectedExtensions.has(extension.name)).map(({ tool }) => tool.name);
-		const selectedTools = new Set(Array.isArray(toolChoice)
-			? toolChoice
-			: defaultTools.filter((name) => !toolChoice?.remove?.includes(name)));
-		const tools = registry.tools().map(({ extension, tool }) => ({
+		const selectedTools = new Set(Array.isArray(toolChoice) ? toolChoice : defaultTools.filter((name) => !toolChoice?.remove.includes(name)));
+		const loadedTools = registry.tools().map(({ extension, tool }) => ({
 			extension: extension.name,
 			name: tool.name,
 			replay: tool.replay ?? "unsafe (default)",
 			executionMode: tool.executionMode ?? "configured default",
-				selected: selectedExtensions.has(extension.name) && selectedTools.has(tool.name),
+			selected: selectedExtensions.has(extension.name) && selectedTools.has(tool.name),
 		}));
+		const recentTools = inspectRecentTools(view.entries);
 		return {
 			brain: {
-				model: snapshot.agent.model ? { provider: snapshot.agent.model.provider, modelId: snapshot.agent.model.modelId } : null,
-				thinkingLevel: snapshot.agent.thinkingLevel ?? null,
+				model: agent.model ? { provider: agent.model.provider, modelId: agent.model.modelId } : null,
+				thinkingLevel: agent.thinkingLevel ?? null,
 				extensions: [...selectedExtensions],
 				instructions: SYSTEM_PROMPT,
-				usage: snapshot.usage,
+				usage: view.docs["pi.usage"] ?? null,
 				sessions,
 				tasks,
 				pending,
-				transcript: entries.slice(-30).map((entry) => ({
-					id: String(entry.id),
-					kind: entry.kind,
-					messages: (entry.model ?? []).map(inspectMessage),
-				})),
+				transcript: view.entries.map(transcriptItem),
 				live: {
-					generation: snapshot.generation ? {
-						attempt: snapshot.generation.attempt,
-						...(snapshot.generation.retry ? { retry: snapshot.generation.retry } : {}),
-						...(snapshot.generation.deferred ? { deferred: snapshot.generation.deferred } : {}),
+					generation: live.generation ? {
+						attempt: live.generation.attempt,
+						...(live.generation.retry ? { retry: live.generation.retry } : {}),
+						...(live.generation.deferred ? { deferred: live.generation.deferred } : {}),
 					} : null,
-					inbox: snapshot.inbox,
-					compactions: snapshot.compactions,
+					run: live.run ? { turns: live.run.turns } : null,
+					runFailure: live.runFailure ? { reason: live.runFailure.reason, ...(live.runFailure.detail ? { detail: live.runFailure.detail } : {}) } : null,
+					compactionFailure: live.compactionFailure ?? null,
+					inbox: inboxItems(view),
+					compactions: live.compactions ?? [],
 				},
 			},
 			hands: {
-				loadedTools: tools,
+				loadedTools,
 				nestedTools: this.nestedToolGroups,
-				currentCalls: (snapshot.tools ?? []).map((slot) => ({
-					name: slot.name,
-					status: slot.status,
-					...(slot.output ? { output: slot.output.slice(-2_000) } : {}),
-					...(slot.diagnostics?.length ? { diagnostics: slot.diagnostics } : {}),
-				})),
-				recentTools: inspectRecentTools(entries),
+				currentCalls: toolCalls(live),
+				recentTools,
 				workspaceFiles,
 				artifactRepos: artifactRepos.map(({ name, description }) => ({ name, ...(description ? { description } : {}) })),
 				mcpServers: this.mcp.listServers().map(({ id, name, server_url }) => ({ id, name, endpoint: safeMcpEndpoint(server_url) })),
 				inspectionErrors,
 				browser: {
-					executions: browserExecutions.map(({ id, status, code, error }) => ({ id, status, code: code.slice(0, 1_200), ...(error ? { error } : {}) })),
-					session: browserSession ? {
-						sessionId: browserSession.sessionId,
-						targets: (browserSession.targets ?? []).slice(0, 10).map(({ id, type, url, title }) => ({ id, ...(type ? { type } : {}), ...(url ? { url } : {}), ...(title ? { title } : {}) })),
-					} : null,
+					name: this.browser.name,
+					recentCalls: recentTools.filter((call) => call.name === "browser").map(({ name: _name, ...call }) => call),
 				},
 				sandbox: {
 					containerRunning: Boolean(this.ctx.container?.running),
@@ -540,49 +572,80 @@ export class PiAgent extends DurableAgent<Env> {
 	}
 }
 
+/** Pi renders state, not events: the Event Lab gets a compact copy of the conversation view on every change. */
+function projectView(view: ConversationView): ConversationSnapshot {
+	const live = (view.docs["pi.live"] ?? {}) as LiveState;
+	const message = live.generation?.message;
+	return {
+		entries: view.entries.slice(-30).map(transcriptItem),
+		running: live.run !== undefined,
+		...(live.run ? { turns: live.run.turns } : {}),
+		...(message ? { streaming: { role: message.role, content: messageContent(message).slice(-8_000), text: messageText(message).slice(-8_000) } } : {}),
+		...(live.generation?.retry ? { retry: live.generation.retry } : {}),
+		tools: toolCalls(live),
+		...(live.runFailure ? { runFailure: { reason: live.runFailure.reason, ...(live.runFailure.detail ? { detail: live.runFailure.detail } : {}) } } : {}),
+		compactions: (live.compactions ?? []).slice(-5),
+		inbox: inboxItems(view).slice(-10),
+		usage: view.docs["pi.usage"],
+	};
+}
+
+function toolCalls(live: LiveState): ToolCallView[] {
+	return [
+		...(live.tools ?? []).map((slot) => ({ slot, nested: false })),
+		...(live.nestedTools ?? []).map((slot) => ({ slot, nested: true })),
+	].map(({ slot, nested }) => ({
+		name: slot.name,
+		status: slot.status,
+		...(nested ? { nested } : {}),
+		...(slot.output ? { output: slot.output.slice(-2_000) } : {}),
+		...(slot.diagnostics?.length ? { diagnostics: slot.diagnostics } : {}),
+	}));
+}
+
+function inboxItems(view: ConversationView): readonly unknown[] {
+	const inbox = view.docs["pi.inbox"] as { items?: unknown[] } | undefined;
+	return inbox?.items ?? [];
+}
+
+function transcriptItem(entry: EntryRecord): TranscriptItem {
+	return { id: String(entry.id), kind: entry.kind, messages: (entry.model ?? []).map(inspectMessage) };
+}
+
 function assistantEntryText(entry: EntryRecord | undefined): string {
 	const message = entry?.model?.[0];
 	if (message?.role !== "assistant") return "";
 	return message.content.map((part) => part.type === "text" ? part.text : "").join("");
 }
 
-function inspectMessage(message: EntryRecord["model"] extends readonly (infer Message)[] | undefined ? Message : never) {
-	const value = message as unknown as { role?: string; content?: unknown };
-	const rawContent = value.content;
-	const parts = Array.isArray(rawContent)
-		? rawContent
-		: typeof rawContent === "string"
-			? [{ type: "text", text: rawContent }]
-			: rawContent && typeof rawContent === "object"
-				? ("type" in rawContent ? [rawContent] : Object.values(rawContent))
-				: [];
-	const content = parts.flatMap((part) => {
-		if (!part || typeof part !== "object") return [];
-		const record = part as Record<string, unknown>;
-		if (record.type === "text" && typeof record.text === "string") return [record.text];
-		if (record.type === "toolCall" && typeof record.name === "string") {
-			return [`Tool call: ${record.name}${record.arguments === undefined ? "" : ` ${JSON.stringify(record.arguments)}`}`];
-		}
-		if (record.type === "toolResult") return ["Tool result"];
-		return [];
-	}).join("\n").slice(0, 2_000);
-	return { role: value.role ?? "unknown", content };
+type ContentPart = Record<string, unknown>;
+
+function contentParts(content: unknown): ContentPart[] {
+	if (Array.isArray(content)) return content.filter((part): part is ContentPart => Boolean(part) && typeof part === "object");
+	if (typeof content === "string") return [{ type: "text", text: content }];
+	return [];
 }
 
-function compactTrajectorySnapshot(snapshot: SnapshotEvent) {
-	return {
-		type: "snapshot" as const,
-		generation: snapshot.generation,
-		history: snapshot.entries.slice(-30).map((entry) => ({
-			id: String(entry.id),
-			kind: entry.kind,
-			messages: (entry.model ?? []).map(inspectMessage),
-		})),
-		tools: snapshot.tools.map(({ name, status, output }) => ({ name, status, ...(output ? { output: output.slice(-1_000) } : {}) })),
-		compactions: snapshot.compactions.slice(-5),
-		inbox: snapshot.inbox.slice(-10),
-		usage: snapshot.usage,
-	};
+function messageContent(message: { content?: unknown }): string {
+	return contentParts(message.content).flatMap((part) => {
+		if (part.type === "text" && typeof part.text === "string") return [part.text];
+		if (part.type === "toolCall" && typeof part.name === "string") {
+			return [`Tool call: ${part.name}${part.arguments === undefined ? "" : ` ${JSON.stringify(part.arguments)}`}`];
+		}
+		return [];
+	}).join("\n");
+}
+
+function messageText(message: { content?: unknown }): string {
+	return contentParts(message.content).flatMap((part) => part.type === "text" && typeof part.text === "string" ? [part.text] : []).join("\n");
+}
+
+function inspectMessage(message: unknown) {
+	const value = message as { role?: string; content?: unknown; toolName?: string };
+	const content = value.role === "toolResult"
+		? `Tool result${value.toolName ? ` ${value.toolName}` : ""}: ${messageText(value)}`
+		: messageContent(value);
+	return { role: value.role ?? "unknown", content: content.slice(0, 2_000) };
 }
 
 function inspectRecentTools(entries: readonly EntryRecord[]): AgentInspection["hands"]["recentTools"] {
@@ -590,15 +653,11 @@ function inspectRecentTools(entries: readonly EntryRecord[]): AgentInspection["h
 	const calls: Array<{ id?: string; item: AgentInspection["hands"]["recentTools"][number] }> = [];
 	for (const entry of entries) {
 		for (const message of entry.model ?? []) {
-			const value = message as unknown as { role?: string; toolCallId?: string; content?: unknown; isError?: boolean };
-			const parts = Array.isArray(value.content) ? value.content : [];
-			if (value.role === "tool" && typeof value.toolCallId === "string") {
-				const result = parts.flatMap((block) => block && typeof block === "object" && "text" in block && typeof block.text === "string" ? [block.text] : []).join("\n");
-				results.set(value.toolCallId, { result: result.slice(0, 1_000), isError: value.isError === true });
+			const value = message as { role?: string; toolCallId?: string; content?: unknown; isError?: boolean };
+			if (value.role === "toolResult" && typeof value.toolCallId === "string") {
+				results.set(value.toolCallId, { result: messageText(value).slice(0, 1_000), isError: value.isError === true });
 			}
-			for (const item of parts) {
-				if (!item || typeof item !== "object") continue;
-				const part = item as Record<string, unknown>;
+			for (const part of contentParts(value.content)) {
 				if (part.type === "toolCall" && typeof part.name === "string") {
 					calls.push({
 						id: typeof part.id === "string" ? part.id : undefined,
@@ -611,15 +670,17 @@ function inspectRecentTools(entries: readonly EntryRecord[]): AgentInspection["h
 	return calls.slice(-12).map(({ id, item }) => ({ ...item, ...(id && results.has(id) ? results.get(id) : {}) }));
 }
 
-function toPiWorkspaceTools(computer: ReturnType<typeof createPiTools>): ToolRegistration[] {
+/** Computer's read-only workspace tools, registered directly with Pi. Reads are safe to repeat after an eviction. */
+function workspaceTools(computer: CreatePiToolsResult): ToolRegistration[] {
 	return computer.tools.map((tool) => ({
 		name: tool.name,
 		description: tool.description,
-		parameters: Type.Unsafe<Record<string, unknown>>(tool.parameters),
+		parameters: tool.parameters,
 		replay: "safe",
-		execute: async (args) => {
-			const result = await traceTool(tool.name, () => computer.execute({ id: crypto.randomUUID(), name: tool.name, arguments: args }));
-			return { content: result.content, isError: result.isError };
+		execute: async (args, _api, context) => {
+			const result = await traced(`agent.tool.${tool.name}`, { "agent.tool.name": tool.name }, () =>
+				computer.execute({ id: crypto.randomUUID(), name: tool.name, arguments: args }, { abortSignal: context.abortSignal }));
+			return { output: result.content, isError: result.isError };
 		},
 	}));
 }
@@ -633,67 +694,15 @@ function describeToolSet(group: string, tools: object): AgentInspection["hands"]
 	});
 }
 
-function parseMcpServers(value: string | undefined): Array<{ name: string; url: string; headers?: Record<string, string> }> {
-	if (!value) return [];
-	const parsed: unknown = JSON.parse(value);
-	if (!Array.isArray(parsed)) throw new Error("MCP_SERVERS_JSON must be a JSON array");
-	return parsed.map((entry, index) => {
-		if (!entry || typeof entry !== "object") throw new Error(`MCP server ${index} must be an object`);
-		const server = entry as Record<string, unknown>;
-		if (typeof server.name !== "string" || !server.name || typeof server.url !== "string" || !server.url) {
-			throw new Error(`MCP server ${index} requires a name and URL`);
-		}
-		if (server.headers !== undefined && (!server.headers || typeof server.headers !== "object" || Array.isArray(server.headers) || Object.values(server.headers).some((header) => typeof header !== "string"))) {
-			throw new Error(`MCP server ${index} headers must be string values`);
-		}
-		return { name: server.name, url: server.url, ...(server.headers ? { headers: server.headers as Record<string, string> } : {}) };
-	});
+function parseMcpServers(value: string | undefined) {
+	return value ? decodeMcpServers(value) : [];
 }
 
 function safeMcpEndpoint(value: string): string {
 	try {
-		const endpoint = new URL(value);
-		return endpoint.origin;
+		return new URL(value).origin;
 	} catch {
 		return "configured endpoint";
 	}
 }
 
-function errorMessage(error: unknown): string {
-	return (error instanceof Error ? error.message : String(error)).slice(0, 240);
-}
-
-function toPiTools(toolSet: Record<string, unknown>): ToolRegistration[] {
-	return Object.entries(toolSet).flatMap(([name, raw]) => {
-		if (!raw || typeof raw !== "object") return [];
-		const tool = raw as AiTool;
-		if (!tool.inputSchema || typeof tool.execute !== "function") return [];
-		const parameters = Type.Unsafe<Record<string, unknown>>(z.toJSONSchema(tool.inputSchema));
-		return [{
-			name,
-			description: tool.description ?? name,
-			parameters,
-			execute: async (args, _api) => {
-				const result = await traceTool(name, () => tool.execute!(args as Record<string, unknown>, { toolCallId: crypto.randomUUID(), messages: [] }));
-				return { content: [{ type: "text", text: typeof result === "string" ? result : JSON.stringify(result) }] };
-			},
-		}];
-	});
-}
-
-function traceTool<T>(name: string, run: () => Promise<T>): Promise<T> {
-	return withCloudflareSpan(`agent.tool.${name}`, { "agent.tool.name": name }, async () => {
-		const startedAt = Date.now();
-		try {
-			const result = await Effect.runPromise(Effect.tryPromise({
-				try: run,
-				catch: (cause) => new Error(`Tool ${name} failed`, { cause }),
-			}).pipe(Effect.withSpan(`agent.tool.${name}`), withObservability));
-			console.log(JSON.stringify({ event: "agent.tool", name, outcome: "ok", durationMs: Date.now() - startedAt }));
-			return result;
-		} catch (error) {
-			console.error(JSON.stringify({ event: "agent.tool", name, outcome: "error", durationMs: Date.now() - startedAt, error: error instanceof Error ? error.message : String(error) }));
-			throw error;
-		}
-	});
-}

@@ -11,46 +11,49 @@ HTTP request
          └─ one PiAgent Durable Object per agent
               ├─ Pi Durable: conversation, tasks, and child conversations
               ├─ Computer: files, shell tools, and Artifacts Git
-              ├─ Code Mode: combines workspace, browser, web search, and MCP tools
+              ├─ Code Mode: combines workspace, web, and MCP tools in one script
+              ├─ Browser, Web Search, Web Fetch: Cloudflare Agents' Pi tools
               └─ Linux Container: optional commands and build tools
 ```
 
 The main pieces have separate jobs:
 
 - **Pi Durable** runs the model conversation and durable tasks. Its transcript and task tables live in the agent Durable Object's SQLite database.
-- **Cloudflare Agents** supplies the Durable Object lifecycle, browser and MCP connections, and `PiHarness`, which stores Pi's data and wakes it to resume work after eviction or restart.
+- **Cloudflare Agents** supplies the Durable Object lifecycle, MCP connections, and `PiHarness`, which stores Pi's data and wakes it to resume work after eviction or restart. Its first-party Pi tools provide the persistent `browser` (a `Browser` lifecycle capability on Browser Run), `web_search`, and `web_fetch`.
 - **Cloudflare Code Mode** is one tool offered to Pi Durable. The model can write a short program that combines several tools in one sandbox run.
 - **Computer** provides the persistent workspace and Artifacts Git. The Linux Container is separate; its filesystem is saved as a snapshot after commands and restored when needed.
 
 Launched agents are separate Durable Objects. A `delegate` call creates a child conversation inside its parent's object, so it shares that agent's tools and workspace.
 
-## Code Mode and Pi 1.0
+## Code Mode and Pi Durable 1.5
 
-This project uses **Cloudflare Code Mode**, created with `createCodeTool()` and adapted into a Pi Durable tool. It gives the model one `code_mode` tool with access to four groups:
+This project uses **Cloudflare Code Mode**, created with `createCodeTool()` and registered as one Pi Durable tool, `code_mode`. Scripts run in a Dynamic Worker (`DynamicWorkerExecutor`) and can call three groups:
 
-- `workspace`: Computer file and shell tools
-- `browser`: Cloudflare Browser tools
-- `web`: Cloudflare Web Search
+- `workspace`: Computer's AI SDK workspace tools (`createAITools` from `@cloudflare/computer/tools/ai-sdk`), including `exec` on the worker shell
+- `web`: `search` and `fetch`, from `agents/websearch/ai-sdk` and `agents/webfetch/ai-sdk`
 - `mcp`: tools from configured MCP servers
 
-This is not Pi 1.0's built-in `codemode` extension. Pi Durable has its own extension and tool registration API; Pi's built-in extensions are not loaded automatically. The project also does not create Cloudflare's separate durable Code Mode runtime, which stores Code Mode execution history, approvals, and snippets. Pi Durable still persists the agent's conversation and tasks.
+The browser is not in Code Mode: its tool already takes a CDP script, and Agents' `browserTool` for Pi gives each conversation its own tab.
 
-The Worker exports Cloudflare's `CodemodeRuntime` class for the Code Mode facet system, but the agent currently uses `DynamicWorkerExecutor` with `createCodeTool()`. See the [Pi changelog](https://pi.dev/changelog), [Pi Code Mode package](https://github.com/earendil-works/pi/blob/main/packages/codemode/README.md), and [Cloudflare Code Mode](https://github.com/cloudflare/agents/tree/main/packages/codemode).
+This is not Pi's built-in durable `codemode` extension. On Cloudflare that extension needs a `RemoteCodemodeSandbox` in a separately deployed Worker; this project stays a single Worker. The Worker exports Cloudflare's `CodemodeRuntime` class for the Code Mode facet system, but the agent uses `DynamicWorkerExecutor` with `createCodeTool()`. See the [pi-durable README](https://github.com/earendil-works/pi/tree/main/packages/durable), [Pi Code Mode on Cloudflare](https://github.com/earendil-works/pi/blob/main/packages/codemode/README.md#usage-on-cloudflare-workers), and [Cloudflare Code Mode](https://github.com/cloudflare/agents/tree/main/packages/codemode).
 
-Pi's lifecycle integration uses Cloudflare Agents' beta [`PiHarness`](https://developers.cloudflare.com/agents/harnesses/pi/). This owns the SQLite-backed Pi storage and recovery queue. The Worker keeps its HTTP API and tool extensions around that harness. Sessions from the earlier JSONL-backed implementation are not imported automatically.
+Pi's lifecycle integration uses Cloudflare Agents' beta [`PiHarness`](https://developers.cloudflare.com/agents/harnesses/pi/). It owns the SQLite-backed Pi storage and recovery job; the factory passes its `onWake` to `Harness.open`, so the object can hibernate while Pi's tasks sleep. Tool parameters are JSON Schema built with `@earendil-works/pi-schema`. Pi's `onReport` reports (storage failures, interrupted or faulted tasks) are logged as `pi.report`.
+
+`agents` 0.33 supports exactly one Pi minor (`~1.5.0`). Pi 1.5 stores conversations in a format Pi 1.4 cannot read, so roll a bad deploy forward rather than back.
 
 ## Capabilities
 
 Each agent can:
 
 - Continue its Pi Durable conversation and resume queued work after a Durable Object restart.
-- Use `code_mode` to combine workspace, browser, web search, and MCP calls.
+- Use `code_mode` to combine workspace, web search, web fetch, and MCP calls.
+- Search and read the web with `web_search` and `web_fetch`, and drive a persistent browser with `browser`.
 - Generate images through the Workers AI binding.
 - Run commands in an on-demand Linux Container whose filesystem is snapshotted between commands.
 - Delegate focused work to a durable child conversation.
 - Create and use Git repositories through Cloudflare Artifacts.
 
-Effect v4 spans and Cloudflare custom spans cover orchestration, agent runs, and tool calls. Wrangler invocation logs and traces are enabled in `wrangler.jsonc`; structured logs also record status changes, tool outcomes, errors, and durations.
+Effect spans (run through one `ManagedRuntime` with a logging tracer) and Cloudflare custom spans cover orchestration, agent runs, and tool calls; Computer's Cloudflare observer adds workspace spans. Request bodies and `MCP_SERVERS_JSON` are decoded with Effect Schema. Wrangler invocation logs and traces are enabled in `wrangler.jsonc`; structured logs also record status changes, tool outcomes, errors, and durations.
 
 ## Run locally
 
@@ -70,7 +73,7 @@ Wrangler bindings are declared in `wrangler.jsonc`. In local mode, Workers AI an
 Optional settings:
 
 - `MODEL_ID`: Workers AI model ID. Defaults to `@cf/zai-org/glm-5.3-flash`.
-- `AI_GATEWAY_ID`: AI Gateway ID for Web Search. Defaults to `default`.
+- `AI_GATEWAY_ID`: AI Gateway ID that bills Web Search. Defaults to `default`.
 - `MCP_SERVERS_JSON`: JSON array of MCP servers, each with a `name`, `url`, and optional `headers` object.
 
 Example MCP value:
@@ -85,19 +88,19 @@ Store credentials in Wrangler secrets rather than in checked-in files. For examp
 
 Deploy with `npx wrangler deploy`. The HTTP API does not add authentication; protect the Worker before exposing it publicly.
 
-The repository's `.npmrc` allows fresh package releases. This setting applies only in this repository.
+The repository's `.npmrc` sets `min-release-age=0`, so fresh package releases install without a cooldown. This setting applies only in this repository. `package.json` has two overrides: `undici` inside `guarded-fetch` (pulled in by `just-bash`, which the worker shell needs) is raised to a patched 7.x release, and `ws` is held at 8.21.0, the exact optional peer Chord 1.5 declares, so `npm ci` accepts the lockfile.
 
 ## Runtime Event Lab
 
 The home page is a hands-on view of one agent run:
 
 1. Launch the warehouse task. The agent writes a restock plan through its workspace tools.
-2. Watch the live event log and final response. Events are also saved with the agent and replayed when its WebSocket reconnects.
+2. Watch the live event log and final response. The WebSocket sends Pi's conversation view (transcript window, streamed answer, running tools, and why a run ended unanswered) on every change; runtime events are also saved with the agent and replayed when the socket reconnects.
 3. Disconnect and reconnect the log socket while the durable task runs. The submitted PiHarness operation is separate from that viewer connection.
 4. Arm a five-second durable deadline or trigger it immediately. This calls `PiHarness.abort()` and ends the active operation.
-5. Restart the Durable Object while the operation is pending. Pi Durable reopens its stored transcript and tasks, then continues the same operation. Use **Resume run** to reconnect to that operation; it does not submit the prompt again.
+5. Restart the Durable Object while the operation is pending. Pi Durable reopens its stored transcript and tasks, then continues the same operation; a model request cut off mid-answer counts as a failed attempt and is retried after Pi's backoff. Use **Resume run** to reconnect to that operation; it does not submit the prompt again.
 
-The **Brain** view shows the active Pi model, session tree, live durable task graph, pending submissions, usage, compactions, recent transcript, and the saved trajectory when the viewer reconnects. The **Hands** view shows registered tools and replay policies, completed and active calls, up to 100 durable workspace paths, attached Artifacts repositories, configured MCP endpoints, Browser session targets and recent executions, and the Linux Container's snapshot state. Computer's Pi adapter exposes direct read-only workspace tools; Code Mode retains the multi-tool workspace, Browser, web-search, and MCP workflow. Replay labels describe each tool's configured policy; they do not predict which individual call is queued to replay. These inspection routes and the demo WebSocket work only from `localhost`; they do not expose transcript or tool state from a deployed Worker.
+The **Brain** view shows the active Pi model, session tree, live durable task graph, pending submissions, usage, compactions, the run's tool rounds or why it ended unanswered, and the recent transcript. The **Hands** view shows registered tools and replay policies, active and nested calls, completed calls, up to 100 durable workspace paths, attached Artifacts repositories, configured MCP endpoints, recent browser calls, and the Linux Container's snapshot state. Computer's Pi adapter exposes direct read-only workspace tools; Code Mode retains the multi-tool workspace, Browser, web-search, and MCP workflow. Replay labels describe each tool's configured policy; they do not predict which individual call is queued to replay. These inspection routes and the demo WebSocket work only from `localhost`; they do not expose transcript or tool state from a deployed Worker.
 
 The restart experiment uses `DurableObjectState.abort()` to force an abrupt Durable Object restart; it does not allocate memory until an OOM occurs. If local Wrangler does not implement this API, set `config.dev` to `false` in `package.json` and run `npm run dev` to use Wrangler's remote preview. Pi Durable saves its conversation and task state in Durable Object storage. The model does not preserve hidden activations, so it may need another model call to continue from the saved point. Container files restore from the latest completed container snapshot; an interrupted command may need to be run again.
 

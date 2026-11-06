@@ -2,7 +2,7 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "pi-cloudflare-effects",
 	"main": "src/index.ts",
-	"compatibility_date": "2026-10-02",
+	"compatibility_date": "2026-11-04",
 	"compatibility_flags": ["nodejs_compat", "experimental"],
 	"assets": {
 		"directory": "./public",

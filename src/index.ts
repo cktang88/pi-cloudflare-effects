@@ -1,8 +1,10 @@
-import type { Env, RunInput } from "./types";
-import type { DemoInterrupt } from "./types";
-import { Orchestrator } from "./orchestrator";
-import { PiAgent } from "./worker-agent";
 import { routeAgentRequest } from "agents";
+import { Schema } from "effect";
+import { errorMessage } from "./observability";
+import { Orchestrator } from "./orchestrator";
+import { DeadlineInput, InterruptInput, RunInput } from "./schemas";
+import type { Env } from "./types";
+import { PiAgent } from "./worker-agent";
 
 export { Orchestrator, PiAgent };
 export { CodemodeRuntime } from "@cloudflare/codemode";
@@ -18,7 +20,7 @@ export default {
 		const orchestrator = env.ORCHESTRATOR.get(env.ORCHESTRATOR.idFromName("main"));
 
 		if (url.pathname === "/agents" && request.method === "POST") {
-			const input = await readInput(request);
+			const input = await readBody(request, decodeRunInput);
 			if (input instanceof Response) return input;
 			try {
 				return json(await orchestrator.launch(input.prompt), 202);
@@ -55,15 +57,15 @@ export default {
 			}
 
 			if (request.method === "POST" && action === "run") {
-				const input = await readInput(request);
+				const input = await readBody(request, decodeRunInput);
 				if (input instanceof Response) return input;
 				return json(await orchestrator.runAgent(agentId, input.prompt));
 			}
 
 			if (request.method === "POST" && action === "interrupt") {
-				const cause = await readInterrupt(request);
-				if (cause instanceof Response) return cause;
-				return json(await orchestrator.interruptDemoRun(agentId, cause));
+				const input = await readBody(request, decodeInterruptInput);
+				if (input instanceof Response) return input;
+				return json(await orchestrator.interruptDemoRun(agentId, input.cause));
 			}
 
 			if (request.method === "POST" && action === "resume") {
@@ -71,9 +73,9 @@ export default {
 			}
 
 			if (request.method === "POST" && action === "deadline") {
-				const seconds = await readDeadline(request);
-				if (seconds instanceof Response) return seconds;
-				return json(await orchestrator.armDemoDeadline(agentId, seconds));
+				const input = await readBody(request, decodeDeadlineInput);
+				if (input instanceof Response) return input;
+				return json(await orchestrator.armDemoDeadline(agentId, input.seconds));
 			}
 		} catch (error) {
 			return errorResponse(error);
@@ -83,47 +85,27 @@ export default {
 	},
 } satisfies ExportedHandler<Env>;
 
-async function readInput(request: Request): Promise<RunInput | Response> {
+const decodeRunInput = Schema.decodeUnknownSync(RunInput);
+const decodeInterruptInput = Schema.decodeUnknownSync(InterruptInput);
+const decodeDeadlineInput = Schema.decodeUnknownSync(DeadlineInput);
+
+/** Parses a JSON body and decodes it with an Effect Schema; a bad body is a 400 with the decoder's message. */
+async function readBody<A>(request: Request, decode: (input: unknown) => A): Promise<A | Response> {
 	let body: unknown;
 	try {
 		body = await request.json();
 	} catch {
 		return json({ error: "Body must be valid JSON" }, 400);
 	}
-	if (!body || typeof body !== "object" || !("prompt" in body) || typeof body.prompt !== "string" || !body.prompt.trim()) {
-		return json({ error: "prompt must be a non-empty string" }, 400);
+	try {
+		return decode(body);
+	} catch (error) {
+		return json({ error: errorMessage(error) }, 400);
 	}
-	return { prompt: body.prompt.trim() };
 }
 
 function isLocalDemoRequest(hostname: string): boolean {
 	return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]";
-}
-
-async function readInterrupt(request: Request): Promise<DemoInterrupt | Response> {
-	let body: unknown;
-	try {
-		body = await request.json();
-	} catch {
-		return json({ error: "Body must be valid JSON" }, 400);
-	}
-	if (!body || typeof body !== "object" || !("cause" in body) || (body.cause !== "deadline" && body.cause !== "runtime-crash")) {
-		return json({ error: "cause must be deadline or runtime-crash" }, 400);
-	}
-	return body.cause;
-}
-
-async function readDeadline(request: Request): Promise<number | Response> {
-	let body: unknown;
-	try {
-		body = await request.json();
-	} catch {
-		return json({ error: "Body must be valid JSON" }, 400);
-	}
-	if (!body || typeof body !== "object" || !("seconds" in body) || typeof body.seconds !== "number" || !Number.isInteger(body.seconds) || body.seconds < 1 || body.seconds > 300) {
-		return json({ error: "seconds must be an integer from 1 to 300" }, 400);
-	}
-	return body.seconds;
 }
 
 function json(value: unknown, status = 200): Response {
@@ -131,7 +113,7 @@ function json(value: unknown, status = 200): Response {
 }
 
 function errorResponse(error: unknown): Response {
-	const message = error instanceof Error ? error.message : String(error);
+	const message = errorMessage(error);
 	console.error(JSON.stringify({ event: "request.failed", message }));
 	return json({ error: message }, 500);
 }

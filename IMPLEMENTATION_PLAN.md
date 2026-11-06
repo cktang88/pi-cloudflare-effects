@@ -24,5 +24,7 @@
 - [x] Document current setup, local dependency age override, optional MCP service suggestions, and platform limits.
 - [x] Verify `npm ci` and TypeScript using Node.js 24.19.
 - [x] Run a clean install without `legacy-peer-deps`, typecheck, and Wrangler dry-run after migrating to the first-party PiHarness.
+- [x] Upgrade to the releases current on 2026-11-06 (Pi Durable 1.5, Agents 0.33, Computer 0.10, Code Mode 0.5.6, Effect 4.1, AI SDK 7.0.163, Wrangler 4.158) and rework each integration to its current docs: pi-schema tool schemas and `output` results, `onWake`/`onReport`, `watch()` views instead of removed event streams, Agents' Pi `browser`/`web_search`/`web_fetch` tools, Computer's `tools/ai-sdk` and Cloudflare observer, Effect `ManagedRuntime`, `Schema.TaggedError`, and Schema-decoded input.
+- [x] Local smoke run with Workers AI and Artifacts stubbed: launch, status, inspect, WebSocket view, run, and resume; the run ends `model_error` as expected without a model.
 - [ ] Smoke-check PiHarness-backed submission and recovery against a working model binding. The local AI binding is unavailable; local Container startup also needs Docker.
 - [x] Create and push the requested GitHub repository.

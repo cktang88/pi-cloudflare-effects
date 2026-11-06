@@ -1,55 +1,55 @@
-import { Effect, Exit, Tracer } from "effect";
 import { tracing } from "cloudflare:workers";
+import { Cause, Effect, Exit, Layer, ManagedRuntime, Schema, Tracer } from "effect";
 
-const tracer = Tracer.make({
-	span(options) {
-		const span = new Tracer.NativeSpan(options);
-		return {
-			get _tag() { return "Span" as const; },
-			get name() { return span.name; },
-			get spanId() { return span.spanId; },
-			get traceId() { return span.traceId; },
-			get parent() { return span.parent; },
-			get annotations() { return span.annotations; },
-			get status() { return span.status; },
-			get attributes() { return span.attributes; },
-			get links() { return span.links; },
-			get sampled() { return span.sampled; },
-			get kind() { return span.kind; },
-			attribute: (key, value) => span.attribute(key, value),
-			event: (name, startTime, attributes) => span.event(name, startTime, attributes),
-			addLinks: (links) => span.addLinks(links),
-			end(endTime, exit) {
-				span.end(endTime, exit);
-				console.log(JSON.stringify({
-					event: "effect.span",
-					name: span.name,
-					traceId: span.traceId,
-					spanId: span.spanId,
-					outcome: Exit.isSuccess(exit) ? "ok" : "error",
-					durationMs: Number((endTime - span.startTime) / 1_000_000n),
-				}));
-			},
-		};
-	},
-});
+/** Logs each Effect span as structured JSON when it ends, beside Cloudflare's own traces. */
+class LoggedSpan extends Tracer.NativeSpan {
+	override end(endTime: bigint, exit: Exit.Exit<unknown, unknown>): void {
+		super.end(endTime, exit);
+		console.log(JSON.stringify({
+			event: "effect.span",
+			name: this.name,
+			traceId: this.traceId,
+			spanId: this.spanId,
+			outcome: Exit.isSuccess(exit) ? "ok" : "error",
+			durationMs: Number((endTime - this.startTime) / 1_000_000n),
+		}));
+	}
+}
 
-export const withObservability = <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
-	effect.pipe(Effect.withTracer(tracer));
+const tracer = Tracer.make({ span: (options) => new LoggedSpan(options) });
 
-export const withCloudflareSpan = <A>(
-	name: string,
-	attributes: Record<string, string | number | boolean | undefined>,
-	run: () => Promise<A>,
-): Promise<A> => tracing.enterSpan(name, async (span) => {
-	span.setAttributes(attributes);
-	try {
-		const result = await run();
-		span.setAttribute("agent.outcome", "ok");
-		return result;
-	} catch (error) {
-		span.setAttribute("agent.outcome", "error");
+/** One runtime for the isolate, so every Effect program shares the tracer. */
+export const runtime = ManagedRuntime.make(Layer.succeed(Tracer.Tracer, tracer));
+
+export class OperationFailed extends Schema.TaggedError<OperationFailed>()("OperationFailed", {
+	operation: Schema.String,
+	message: Schema.String,
+	cause: Schema.optional(Schema.Defect()),
+}) {}
+
+type SpanAttributes = Record<string, string | number | boolean | undefined>;
+
+/**
+ * Runs an async operation as an Effect span inside a Cloudflare custom span.
+ * Failures become `OperationFailed` with the underlying message kept, so callers
+ * (and models, for tool calls) still see what went wrong.
+ */
+export const traced = <A>(name: string, attributes: SpanAttributes, run: (signal: AbortSignal) => Promise<A>): Promise<A> =>
+	tracing.enterSpan(name, async (span) => {
+		span.setAttributes(attributes);
+		const program = Effect.tryPromise({
+			try: run,
+			catch: (cause) => new OperationFailed({ operation: name, message: errorMessage(cause), cause }),
+		}).pipe(Effect.withSpan(name, { attributes }));
+		const exit = await runtime.runPromiseExit(program);
+		span.setAttribute("agent.outcome", Exit.isSuccess(exit) ? "ok" : "error");
+		if (Exit.isSuccess(exit)) return exit.value;
+		const error = Cause.squash(exit.cause);
 		span.recordException(error instanceof Error ? error : String(error));
 		throw error;
-	}
-});
+	});
+
+export function errorMessage(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
+}
+
