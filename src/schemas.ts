@@ -6,8 +6,44 @@ export const RunInput = Schema.Struct({
 	prompt: Schema.Trim.check(Schema.isNonEmpty({ message: "prompt must be a non-empty string" })),
 });
 
+const Prompt = Schema.Trim.check(Schema.isNonEmpty({ message: "prompt must be a non-empty string" }));
+
+const HistoryItem = Schema.Struct({
+	role: Schema.Literals(["user", "assistant"]),
+	text: Schema.Trim.check(Schema.isNonEmpty({ message: "each history message needs text" })),
+});
+
+/** Starts an agent; it can start from an existing history (Pi 1.6 `init`) and require approvals. */
+export const LaunchInput = Schema.Struct({
+	prompt: Prompt,
+	history: Schema.optionalKey(Schema.Array(HistoryItem)),
+	approvals: Schema.optionalKey(Schema.Boolean),
+	replyMinutes: Schema.optionalKey(Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 1_440 }, { message: "replyMinutes must be an integer from 1 to 1440" }))),
+});
+
+export const MessageInput = Schema.Struct({
+	prompt: Prompt,
+	mode: Schema.Literals(["queue", "steer"]),
+	keep: Schema.Boolean,
+});
+
+export const ForkInput = Schema.Struct({
+	prompt: Schema.optionalKey(Schema.String),
+	note: Schema.optionalKey(Schema.String),
+});
+
+export const AnswerInput = Schema.Struct({
+	key: Schema.NonEmptyString,
+	text: Schema.optionalKey(Schema.String),
+	decision: Schema.optionalKey(Schema.Literals(["allow", "deny"])),
+});
+
+export const McpReconnectInput = Schema.Struct({
+	serverId: Schema.NonEmptyString,
+});
+
 export const InterruptInput = Schema.Struct({
-	cause: Schema.Literals(["deadline", "runtime-crash"]),
+	cause: Schema.Literals(["deadline", "runtime-crash", "abort-all"]),
 });
 
 export const DeadlineInput = Schema.Struct({

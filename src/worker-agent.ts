@@ -10,11 +10,17 @@ import {
 	AssistantEntry,
 	configure,
 	defineExtension,
+	defineSignal,
 	defineTool,
 	Harness,
+	hook,
 	section,
 	createRegistry,
+	SubmissionSettled,
+	ToolTask,
+	UserEntry,
 	type AgentState,
+	type ConversationInit,
 	type ConversationView,
 	type ConversationWatch,
 	type EntryRecord,
@@ -23,7 +29,8 @@ import {
 	type Report,
 	type ToolRegistration,
 } from "@earendil-works/pi-durable";
-import { obj, str } from "@earendil-works/pi-schema";
+import type { AssistantMessage, Usage } from "@earendil-works/pi-ai";
+import { num, obj, str } from "@earendil-works/pi-schema";
 import { Agent, type AgentContext, type Connection, type ConnectionContext } from "agents";
 import { Browser, browserRun } from "agents/browser";
 import { browserTool } from "agents/browser/pi";
@@ -36,11 +43,13 @@ import { webSearchTool } from "agents/websearch/pi";
 import { tracing } from "cloudflare:workers";
 import { errorMessage, traced } from "./observability";
 import { decodeMcpServers } from "./schemas";
-import type { AgentEvent, AgentInspection, AgentStatus, ConversationSnapshot, DemoInterrupt, Env, ToolCallView, TranscriptItem } from "./types";
+import type { AgentEvent, AgentInspection, AgentSettings, AgentStatus, ConversationSnapshot, DemoInterrupt, Env, HistoryItem, LaunchOptions, MessageOptions, ToolCallView, TranscriptItem, WaitDecision, WaitView } from "./types";
 
 const DEFAULT_MODEL = "@cf/zai-org/glm-5.3-flash";
 const CORE_EXTENSION = "cloudflare-agent-tools";
 const SUBAGENT_EXTENSION = "durable-subagents";
+const WAIT_EXTENSION = "tools-that-wait";
+const APPROVAL_EXTENSION = "approval-gate";
 const SYSTEM_PROMPT = `You are an agent running on Pi Durable. Your conversation and work are saved, so a restart resumes where you stopped.
 
 Tools:
@@ -48,19 +57,38 @@ Tools:
 - container_exec: a Linux container whose files are saved between commands. It is separate from the workspace.
 - web_search, web_fetch, and browser.
 - code_mode: one script that calls workspace.*, web.*, and MCP server methods. Inside it, codemode.search() and codemode.describe() list what is available.
+- ask_human: ask the person a question and wait for the reply. You do not stay running while you wait.
+- wait: pause for a number of seconds (for example, before checking something again). You do not stay running while you wait.
+- delegate: hand a self-contained task to a subagent and get its answer.
+- Some tools (exec, delete, container_exec) may need the person's approval first. If a call is refused, say so and continue without it.
 
 Save facts that will help later runs in /memory.md. Check each step before the next, and say what you did and what failed.`;
 /** Computer tools that are safe to run again if a restart interrupts them (same list as the Agents Pi harness example). */
 const REPLAY_SAFE_WORKSPACE_TOOLS = new Set(["read", "ls", "find", "grep", "write", "delete"]);
 const MAX_EVENTS = 300;
+/** The root session's id in PiHarness. */
+const ROOT_SESSION = "1";
+/** Tools the approval gate holds until a person allows them, when approvals are on. */
+const APPROVAL_TOOLS = new Set(["exec", "delete", "container_exec"]);
+const DEFAULT_SETTINGS: AgentSettings = { approvals: false, replyMinutes: 15 };
+const ZERO_USAGE: Usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+
+/**
+ * Pi 1.6 signals. A tool or gate parks on a signal key and holds no invocation (and no
+ * alarm, if it has no deadline) until `PiHarness.signal()` delivers a value.
+ */
+const HumanAnswer = defineSignal({ name: "app.human-answer", version: 1, schema: obj({ text: str({ maxLength: 8_000 }) }) });
+const ApprovalDecision = defineSignal({ name: "app.approval", version: 1, schema: obj({ decision: str({ minLength: 4, maxLength: 5 }), note: str({ maxLength: 2_000 }) }) });
 /** `WebSocket.OPEN`; the constant is not defined on every runtime's global. */
 const SOCKET_OPEN = 1;
 
 const Delegate = obj({ task: str({ minLength: 1, maxLength: 8_000, description: "A self-contained task for the subagent." }) });
 const GenerateImage = obj({
-	modelId: str({ minLength: 1, maxLength: 200, description: "Workers AI image model id, such as @cf/black-forest-labs/flux-1-schnell." }),
+	modelId: str({ minLength: 1, maxLength: 200, description: "Workers AI image model id: @cf/black-forest-labs/flux-2-klein-4b, flux-2-klein-9b, flux-2-dev (FLUX.2), or flux-1-schnell." }),
 	prompt: str({ minLength: 1, maxLength: 4_000 }),
 });
+const AskHuman = obj({ question: str({ minLength: 1, maxLength: 4_000, description: "The question for the person, with any context they need to answer." }) });
+const Wait = obj({ seconds: num({ description: "How long to wait, from 1 to 86400 seconds." }) });
 const ContainerExec = obj({ command: str({ minLength: 1, maxLength: 16_384 }) });
 const CodeMode = obj({ code: str({ minLength: 1, description: "An async arrow function. Connector methods are globals (workspace.*, web.*, and one per MCP server); codemode.search() and codemode.describe() find them." }) });
 
@@ -209,6 +237,10 @@ export class PiAgent extends Agent<Env> {
 	/** Runs on every start, after Browser and PiHarness have started, so Pi is already open. */
 	async onStart(): Promise<void> {
 		this.sql`CREATE TABLE IF NOT EXISTS agent_events (seq INTEGER PRIMARY KEY AUTOINCREMENT, event TEXT NOT NULL)`;
+		// Calls parked on a person, a deadline, or another session, so the page can show and answer them.
+		this.sql`CREATE TABLE IF NOT EXISTS agent_waits (
+			key TEXT PRIMARY KEY, task_id TEXT NOT NULL, kind TEXT NOT NULL, tool TEXT NOT NULL, prompt TEXT NOT NULL,
+			signal_key TEXT, until INTEGER, created_at TEXT NOT NULL, status TEXT NOT NULL, answer TEXT)`;
 		await this.connectMcpServers();
 		const previousBootId = await this.ctx.storage.get<string>("agent:boot-id");
 		const bootId = crypto.randomUUID();
@@ -235,6 +267,18 @@ export class PiAgent extends Agent<Env> {
 	/** The Event Lab has its own messages, so skip the Agents state and identity messages. */
 	shouldSendProtocolMessages(_connection: Connection, _context: ConnectionContext): boolean {
 		return false;
+	}
+
+	/**
+	 * Agents 0.34: chooses the response when a request or WebSocket upgrade to this agent
+	 * fails. Lifecycle no longer sends stacks; this page is localhost-only, so it gets the
+	 * message (never the stack) to show in its event log.
+	 */
+	async onFetchError(request: Request, error: unknown): Promise<Response> {
+		const message = errorMessage(error);
+		const upgrade = request.headers.get("Upgrade")?.toLowerCase() === "websocket";
+		await this.recordEvent("agent.fetch.failed", { path: new URL(request.url).pathname, upgrade, message: message.slice(0, 500) }, "error").catch(() => undefined);
+		return Response.json({ error: upgrade ? "The agent could not open its event stream" : "The agent could not handle this request", message: message.slice(0, 500) }, { status: 500 });
 	}
 
 	async onConnect(connection: Connection): Promise<void> {
@@ -331,9 +375,25 @@ export class PiAgent extends Agent<Env> {
 		}
 	}
 
-	async launch(prompt: string): Promise<{ operationId: string }> {
+	async launch(prompt: string, options: LaunchOptions = {}): Promise<{ operationId: string; seeded: boolean }> {
 		const operationId = crypto.randomUUID();
 		return traced("agent.launch", { "agent.id": this.name, "agent.operation_id": operationId }, async () => {
+			const settings: AgentSettings = {
+				approvals: options.approvals ?? DEFAULT_SETTINGS.approvals,
+				replyMinutes: options.replyMinutes ?? DEFAULT_SETTINGS.replyMinutes,
+			};
+			await this.ctx.storage.put("agent:settings", settings);
+			// Agents 0.34 creates the root session on first use. Creating it here, before the
+			// first submit, lets a new agent start from an existing history (Pi 1.6 `init`).
+			const history = options.history ?? [];
+			const { created } = await this.piHarness.root(history.length ? { init: seedHistory(history, this.ai(this.env.MODEL_ID ?? DEFAULT_MODEL)) } : {});
+			if (history.length) {
+				await this.recordEvent(created ? "agent.session.seeded" : "agent.session.seed_skipped", {
+					messages: history.length,
+					...(created ? {} : { reason: "the root session already existed" }),
+				}, created ? "info" : "warn");
+			}
+			await this.recordEvent("agent.settings", { approvals: settings.approvals, replyMinutes: settings.replyMinutes });
 			await this.saveStatus({ status: "running", operationId });
 			try {
 				await this.piHarness.submit(prompt, { operationId });
@@ -342,8 +402,97 @@ export class PiAgent extends Agent<Env> {
 				throw error;
 			}
 			void this.settleWhenDone(operationId);
+			return { operationId, seeded: history.length > 0 && created };
+		});
+	}
+
+	/**
+	 * Sends another message to the root session. `steer` joins the running work; otherwise
+	 * it queues for its own run. `keep` (Pi 1.6 `onAbort: "keep"`) keeps it queued through
+	 * an abort of everything else, for input its sender can't send again.
+	 */
+	async sendMessage(prompt: string, options: MessageOptions): Promise<{ operationId: string }> {
+		const operationId = crypto.randomUUID();
+		return traced("agent.message", { "agent.id": this.name, "agent.operation_id": operationId }, async () => {
+			await this.piHarness.submit(prompt, {
+				operationId,
+				...(options.mode === "steer" ? { whenBusy: "steer" as const } : {}),
+				...(options.keep ? { onAbort: "keep" as const } : {}),
+			});
+			await this.recordEvent("agent.message.submitted", { mode: options.mode, keep: options.keep, chars: prompt.length }, "info", operationId);
+			await this.saveStatus({ status: "running", operationId });
+			void this.settleWhenDone(operationId);
 			return { operationId };
 		});
+	}
+
+	/** Asks the model to answer the existing transcript again, without a new message (after a failed or turn-limited run). */
+	async continueRun(): Promise<{ operationId: string }> {
+		const operationId = crypto.randomUUID();
+		await this.piHarness.continue({ operationId });
+		await this.recordEvent("agent.run.continued", {}, "info", operationId);
+		await this.saveStatus({ status: "running", operationId });
+		void this.settleWhenDone(operationId);
+		return { operationId };
+	}
+
+	/**
+	 * Forks the root session (Pi 1.6 `sessions.fork` with `init`) and, with a prompt, asks the
+	 * fork. The fork's answer is recorded as an event; the root conversation is unchanged.
+	 */
+	async forkSession(prompt: string | undefined, note: string | undefined): Promise<{ sessionId: string; operationId?: string }> {
+		const forked = await this.piHarness.sessions.fork(ROOT_SESSION, note
+			? { init: seedHistory([{ role: "user", text: `Note for this branch: ${note}` }, { role: "assistant", text: "Understood." }], this.ai(this.env.MODEL_ID ?? DEFAULT_MODEL)) }
+			: {});
+		const session = sessionHandle(forked);
+		const sessionId = String(session.id);
+		await this.recordEvent("agent.session.forked", { from: ROOT_SESSION, sessionId, ...(note ? { note: note.slice(0, 200) } : {}) });
+		if (!prompt) return { sessionId };
+		const operationId = crypto.randomUUID();
+		await session.submit(prompt, { operationId });
+		this.ctx.waitUntil((async () => {
+			try {
+				const result = await session.wait(operationId);
+				await this.recordEvent(result.status === "done" ? "agent.fork.answered" : "agent.fork.unanswered", {
+					sessionId,
+					...(result.status === "done" ? { text: (result.text ?? "").slice(0, 2_000) } : { reason: result.reason ?? "unknown" }),
+				}, result.status === "done" ? "info" : "warn", operationId);
+			} catch (error) {
+				await this.recordEvent("agent.fork.failed", { sessionId, message: errorMessage(error) }, "error", operationId);
+			}
+		})());
+		return { sessionId, operationId };
+	}
+
+	/** Delivers a person's answer or approval decision to a parked call with `PiHarness.signal()`. */
+	async answerWait(key: string, decision: WaitDecision): Promise<{ result: string }> {
+		const [row] = this.sql<WaitRow>`SELECT * FROM agent_waits WHERE key = ${key}`;
+		if (!row) throw new Error("No waiting call with that key");
+		if (row.status !== "waiting") return { result: `already ${row.status}` };
+		// harness.signal() arms the wake job before delivering; pi.signal() would not.
+		const taskId = row.task_id as Parameters<PiHarness["signal"]>[0];
+		let result: string;
+		if (row.kind === "question") {
+			if (!decision.text?.trim()) throw new Error("An answer needs text");
+			result = await this.piHarness.signal(taskId, HumanAnswer, row.signal_key ?? "answer", { text: decision.text.trim() });
+		} else if (row.kind === "approval") {
+			if (decision.decision !== "allow" && decision.decision !== "deny") throw new Error("decision must be allow or deny");
+			result = await this.piHarness.signal(taskId, ApprovalDecision, row.signal_key ?? key, { decision: decision.decision, note: decision.text?.trim() ?? "" });
+		} else {
+			throw new Error(`A ${row.kind} wait can't be answered from here`);
+		}
+		await this.recordEvent("agent.signal.delivered", { kind: row.kind, tool: row.tool, result, ...(decision.decision ? { decision: decision.decision } : {}) }, result === "delivered" ? "info" : "warn");
+		// `closed` and `not_found` mean the call is gone (aborted or finished); `duplicate` means it already has a value.
+		if (result === "closed" || result === "not_found") await this.closeWait(key, "cancelled", result);
+		return { result };
+	}
+
+	/** Agents 0.34: a failed MCP server stays failed until it is reconnected. */
+	async reconnectMcp(serverId: string): Promise<{ state: string }> {
+		await this.reconnectMcpServer(serverId);
+		const state = this.mcp.mcpConnections[serverId]?.connectionState ?? "not connected";
+		await this.recordEvent("agent.mcp.reconnect_requested", { serverId, state: String(state) });
+		return { state: String(state) };
 	}
 
 	/**
@@ -373,11 +522,25 @@ export class PiAgent extends Agent<Env> {
 			name: SUBAGENT_EXTENSION,
 			tools: [defineTool({
 				name: "delegate",
-				description: "Launch a durable subagent for a focused task and return its answer.",
+				description: "Launch a durable subagent for a focused task and return its answer. The call parks while the subagent works.",
 				parameters: Delegate,
-				// If a restart reruns this call, it finds the same child conversation and prompt.
+				// If a restart reruns this call, it finds the same child conversation and the settled answer.
 				replay: "safe",
 				execute: async ({ task }, api, context) => {
+					// Pi 1.6: the child's input was submitted with `notify`, so its settled record
+					// arrives as the SubmissionSettled signal and this call wakes with it.
+					const state = await api.readSignal(SubmissionSettled, "answered", context);
+					if (state !== undefined && "value" in state) {
+						const settled = state.value;
+						await this.closeWait(waitKey(api.taskId, "answered"), settled.status === "done" ? "answered" : "expired", settled.status);
+						if (settled.status !== "done" || settled.type === "write") {
+							return { output: [{ type: "text", text: `Subagent ended unanswered: ${settled.status === "unanswered" ? settled.reason : settled.status}` }], isError: true };
+						}
+						const answer = await api.commit((tx) => tx.entry(settled.answer), context);
+						const message = answer?.model?.[0] as AssistantMessage | undefined;
+						if (message === undefined) return { output: [{ type: "text", text: "Subagent gave no answer" }], isError: true };
+						return { output: message.content.filter((part) => part.type === "text") };
+					}
 					const childId = await api.commit(async (tx) => {
 						const existing = (await tx.scanConversations({ ownerTaskId: api.taskId }, 1)).items[0];
 						if (existing !== undefined) return existing.id;
@@ -390,17 +553,152 @@ export class PiAgent extends Agent<Env> {
 					await api.details({ conversationId: String(childId) }, context);
 					const child = await api.conversation(childId, context);
 					if (!child) throw new Error("Pi Durable child conversation was not created");
-					const submission = await child.submit({ type: "input", content: task, requestId: `delegate:${api.taskId}` }, context);
-					const settled = await submission.wait(context);
-					if (settled.status !== "done" || settled.type !== "input") throw new Error(`Subagent ended unanswered: ${settled.status === "unanswered" ? settled.reason : "no answer"}`);
-					const entry = await api.commit((tx) => tx.entry(AssistantEntry, settled.answer), context);
-					return { output: [{ type: "text", text: assistantEntryText(entry) }] };
+					// The same requestId on a rerun is a duplicate, so the task is submitted once.
+					await child.submit({ type: "input", content: task, requestId: `delegate:${api.taskId}`, notify: { taskId: api.taskId, key: "answered" } }, context);
+					await this.openWait({ key: waitKey(api.taskId, "answered"), taskId: String(api.taskId), kind: "subagent", tool: "delegate", prompt: task, signalKey: "answered" });
+					return { sleep: { signals: [SubmissionSettled.key("answered")] } };
+				},
+				cancel: async (_args, api) => {
+					await this.closeWait(waitKey(api.taskId, "answered"), "cancelled");
 				},
 			})],
 		});
 		this.registry.install(core);
 		this.registry.install(subagents);
+		this.registry.install(this.waitExtension());
+		this.registry.install(this.approvalExtension());
 		return Harness.open(storage, { models, registry: this.registry, onWake, onReport: (report) => this.report(report) }, context);
+	}
+
+	/**
+	 * Pi 1.6 tools that park. `ask_human` waits for a person's answer (with a deadline),
+	 * and `wait` sleeps until a deadline. While parked, a call holds no invocation, so the
+	 * Durable Object can hibernate; PiHarness's wake job brings it back at the deadline.
+	 */
+	private waitExtension(): Extension {
+		return defineExtension({
+			name: WAIT_EXTENSION,
+			tools: [
+				defineTool({
+					name: "ask_human",
+					description: "Ask the person a question and wait for their reply. The agent sleeps until they answer or the reply deadline passes.",
+					parameters: AskHuman,
+					// A rerun reads the same signal and the same memoized deadline.
+					replay: "safe",
+					execute: async ({ question }, api, context) => {
+						const key = waitKey(api.taskId, "answer");
+						const state = await api.readSignal(HumanAnswer, "answer", context);
+						if (state !== undefined && "value" in state) {
+							await this.closeWait(key, "answered", state.value.text);
+							return { output: [{ type: "text", text: `The person answered: ${state.value.text}` }] };
+						}
+						const { replyMinutes } = await this.settings();
+						const until = await api.memo("ask_human.until", api.now() + replyMinutes * 60_000, context);
+						// An expired wake (or a rerun after the deadline) must not park again.
+						if (state !== undefined || api.now() >= until) {
+							await this.closeWait(key, "expired");
+							return { output: [{ type: "text", text: "The person did not answer before the reply deadline. Continue without their answer and say what you assumed." }] };
+						}
+						await this.openWait({ key, taskId: String(api.taskId), kind: "question", tool: "ask_human", prompt: question, signalKey: "answer", until });
+						return { sleep: { signals: [HumanAnswer.key("answer")], until } };
+					},
+					cancel: async (_args, api) => {
+						await this.closeWait(waitKey(api.taskId, "answer"), "cancelled");
+					},
+				}),
+				defineTool({
+					name: "wait",
+					description: "Pause for a number of seconds without keeping the agent running, then continue.",
+					parameters: Wait,
+					replay: "safe",
+					execute: async ({ seconds }, api, context) => {
+						const key = waitKey(api.taskId, "timer");
+						const span = Math.min(86_400, Math.max(1, Math.round(Number(seconds) || 1)));
+						const until = await api.memo("wait.until", api.now() + span * 1_000, context);
+						if (api.now() >= until) {
+							await this.closeWait(key, "expired");
+							return { output: [{ type: "text", text: `Waited ${span} second(s); it is now ${new Date(api.now()).toISOString()}.` }] };
+						}
+						await this.openWait({ key, taskId: String(api.taskId), kind: "timer", tool: "wait", prompt: `Wait ${span} second(s)`, until });
+						return { sleep: { until } };
+					},
+					cancel: async (_args, api) => {
+						await this.closeWait(waitKey(api.taskId, "timer"), "cancelled");
+					},
+				}),
+			],
+		});
+	}
+
+	/**
+	 * Pi 1.6 approval gate: a `beforeTool` hook parks risky calls until a person allows or
+	 * denies them, or the reply deadline passes. Pi reruns the hook on every wake and reopen,
+	 * so it reads the signal first and memoizes the deadline.
+	 */
+	private approvalExtension(): Extension {
+		return defineExtension({
+			name: APPROVAL_EXTENSION,
+			hooks: [hook(ToolTask, {
+				beforeTool: async (call, api, context) => {
+					if (!APPROVAL_TOOLS.has(call.name)) return undefined;
+					if (!(await this.settings()).approvals) return undefined;
+					const signalKey = `approve-${call.id}`;
+					const key = waitKey(api.taskId, signalKey);
+					const state = await api.readSignal(ApprovalDecision, signalKey, context);
+					const { replyMinutes } = await this.settings();
+					const until = await api.memo(`approvals.until.${signalKey}`, api.now() + replyMinutes * 60_000, context);
+					if (state === undefined && api.now() < until) {
+						await this.openWait({ key, taskId: String(api.taskId), kind: "approval", tool: call.name, prompt: JSON.stringify(call.arguments ?? {}).slice(0, 4_000), signalKey, until });
+						return { sleep: { signals: [ApprovalDecision.key(signalKey)], until } };
+					}
+					if (state === undefined || !("value" in state)) {
+						await this.closeWait(key, "expired");
+						return { block: "No approval before the deadline" };
+					}
+					await this.closeWait(key, "answered", state.value.decision);
+					return state.value.decision === "allow" ? undefined : { block: state.value.note ? `Denied: ${state.value.note}` : "Denied by the person" };
+				},
+			})],
+		});
+	}
+
+	private async settings(): Promise<AgentSettings> {
+		return (await this.ctx.storage.get<AgentSettings>("agent:settings")) ?? DEFAULT_SETTINGS;
+	}
+
+	/** Records a parked call once; reruns of the same tool or gate find the row and change nothing. */
+	private async openWait(wait: { key: string; taskId: string; kind: WaitView["kind"]; tool: string; prompt: string; signalKey?: string; until?: number }): Promise<void> {
+		const existing = this.sql<{ key: string }>`SELECT key FROM agent_waits WHERE key = ${wait.key}`;
+		if (existing.length) return;
+		this.sql`INSERT INTO agent_waits (key, task_id, kind, tool, prompt, signal_key, until, created_at, status)
+			VALUES (${wait.key}, ${wait.taskId}, ${wait.kind}, ${wait.tool}, ${wait.prompt}, ${wait.signalKey ?? null}, ${wait.until ?? null}, ${new Date().toISOString()}, 'waiting')`;
+		await this.recordEvent(`agent.wait.${wait.kind}`, {
+			tool: wait.tool,
+			prompt: wait.prompt.slice(0, 500),
+			...(wait.until ? { until: new Date(wait.until).toISOString() } : {}),
+			mechanism: wait.kind === "timer" ? "parked until the deadline; the object may hibernate" : "parked on a signal; the object may hibernate",
+		}, wait.kind === "approval" || wait.kind === "question" ? "warn" : "info");
+	}
+
+	private async closeWait(key: string, status: Exclude<WaitView["status"], "waiting">, answer?: string): Promise<void> {
+		const [row] = this.sql<WaitRow>`SELECT * FROM agent_waits WHERE key = ${key}`;
+		if (!row || row.status !== "waiting") return;
+		this.sql`UPDATE agent_waits SET status = ${status}, answer = ${answer ?? null} WHERE key = ${key}`;
+		await this.recordEvent(`agent.wait.${status}`, { kind: row.kind, tool: row.tool, ...(answer ? { answer: answer.slice(0, 500) } : {}) }, status === "answered" ? "info" : "warn");
+	}
+
+	async getWaits(): Promise<WaitView[]> {
+		return this.sql<WaitRow>`SELECT * FROM agent_waits ORDER BY created_at DESC LIMIT 30`.map((row) => ({
+			key: row.key,
+			taskId: row.task_id,
+			kind: row.kind,
+			tool: row.tool,
+			prompt: row.prompt,
+			status: row.status,
+			createdAt: row.created_at,
+			...(row.until ? { until: new Date(row.until).toISOString() } : {}),
+			...(row.answer ? { answer: row.answer } : {}),
+		}));
 	}
 
 	/** Computer's workspace tools: one list of tools and one executor, used by both Pi and Code Mode. */
@@ -664,6 +962,8 @@ export class PiAgent extends Agent<Env> {
 				tasks,
 				pending,
 				transcript: view.entries.map(transcriptItem),
+				waits: await this.getWaits(),
+				settings: await this.settings(),
 				live: {
 					generation: live.generation ? {
 						attempt: live.generation.attempt,
@@ -689,14 +989,18 @@ export class PiAgent extends Agent<Env> {
 				recentTools,
 				workspaceFiles,
 				artifactRepos: artifactRepos.map(({ name, description }) => ({ name, ...(description ? { description } : {}) })),
-				mcpServers: servers.map(({ id, name, server_url }) => {
+				mcpServers: servers.map((server) => {
+					const { id, name, server_url } = server;
 					const connection = this.mcp.mcpConnections[id];
+					// Agents 0.34: a server that needs the user to authorize again carries a link.
+					const authUrl = (server as { auth_url?: string | null }).auth_url;
 					return {
 						id,
 						name,
 						endpoint: safeMcpEndpoint(server_url),
 						state: connection?.connectionState ?? "not connected",
 						...(connection?.connectionError ? { error: connection.connectionError } : {}),
+						...(authUrl ? { authUrl } : {}),
 					};
 				}),
 				inspectionErrors,
@@ -717,6 +1021,12 @@ export class PiAgent extends Agent<Env> {
 	async interruptDemoRun(cause: DemoInterrupt): Promise<{ interrupted: boolean; operationId?: string }> {
 		const status = await this.getStatus();
 		if (status.status !== "running" || !status.operationId) return { interrupted: false };
+		if (cause === "abort-all") {
+			// With no operation id, abort() withdraws everything except inputs sent with onAbort: "keep".
+			await this.recordEvent("demo.abort_all.requested", { action: "PiHarness.abort()", keeps: "inputs sent with onAbort: keep" }, "warn", status.operationId);
+			const interrupted = await this.piHarness.abort();
+			return { interrupted, operationId: status.operationId };
+		}
 		const details: Record<string, string | number | boolean> = cause === "deadline"
 			? { source: "abort button", action: "PiHarness.abort" }
 			: { source: "restart button", action: "ctx.abort()", note: "restarts the Durable Object; does not use up memory" };
@@ -832,6 +1142,8 @@ function toolCalls(live: LiveState): ToolCallView[] {
 	].map(({ slot, nested }) => ({
 		name: slot.name,
 		status: slot.status,
+		// Pi 1.6: a parked call's slot is `sleeping` (signal or deadline) or `waiting` (child tasks).
+		...(slot.status === "sleeping" || slot.status === "waiting" ? { parked: true } : {}),
 		...(nested ? { nested } : {}),
 		...(slot.output ? { output: slot.output.slice(-2_000) } : {}),
 		...(slot.diagnostics?.length ? { diagnostics: slot.diagnostics } : {}),
@@ -921,3 +1233,60 @@ function safeMcpEndpoint(value: string): string {
 	}
 }
 
+interface WaitRow {
+	key: string;
+	task_id: string;
+	kind: WaitView["kind"];
+	tool: string;
+	prompt: string;
+	signal_key: string | null;
+	until: number | null;
+	created_at: string;
+	status: WaitView["status"];
+	answer: string | null;
+}
+
+/** One wait row per task and signal key. */
+function waitKey(taskId: unknown, signalKey: string): string {
+	return `${String(taskId)}:${signalKey}`;
+}
+
+/**
+ * Pi 1.6 `init`: writes an existing history into a session in the commit that creates it.
+ * Imported messages have no usage, so it is zero; assistant messages name the model.
+ */
+function seedHistory(history: readonly HistoryItem[], model: { api: string; provider: string; id: string }): ConversationInit {
+	return async (tx, conversationId) => {
+		const start = Date.now() - history.length;
+		for (const [index, item] of history.entries()) {
+			const timestamp = start + index;
+			if (item.role === "user") {
+				await tx.appendEntry(UserEntry, conversationId, { model: [{ role: "user", content: item.text, timestamp }] });
+			} else {
+				const message = {
+					role: "assistant",
+					content: [{ type: "text", text: item.text }],
+					api: model.api,
+					provider: model.provider,
+					model: model.id,
+					usage: ZERO_USAGE,
+					stopReason: "stop",
+					timestamp,
+				} as AssistantMessage;
+				await tx.appendEntry(AssistantEntry, conversationId, { model: [message] });
+			}
+		}
+	};
+}
+
+type ForkedSession = {
+	id: unknown;
+	submit(input: string, options: { operationId: string }): Promise<unknown>;
+	wait(operationId: string): Promise<{ status: string; text?: string; reason?: string }>;
+};
+
+/** `sessions.fork()` gives a session handle (or `{ session }`, as `root()` does). */
+function sessionHandle(value: unknown): ForkedSession {
+	const candidate = value as { session?: ForkedSession } & ForkedSession;
+	return candidate.session ?? candidate;
+}

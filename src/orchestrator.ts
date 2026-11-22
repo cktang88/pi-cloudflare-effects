@@ -1,17 +1,17 @@
 import { Agent as DurableAgent, getAgentByName } from "agents";
 import { traced } from "./observability";
-import type { AgentEvent, AgentInspection, AgentStatus, DemoInterrupt, Env, LaunchResult, RunResult } from "./types";
+import type { AgentEvent, AgentInspection, AgentStatus, DemoInterrupt, Env, LaunchOptions, LaunchResult, MessageOptions, RunResult, WaitDecision } from "./types";
 
 const AGENT_PREFIX = "pi-agent:";
 
 export class Orchestrator extends DurableAgent<Env> {
-	async launch(prompt: string): Promise<LaunchResult> {
+	async launch(prompt: string, options: LaunchOptions = {}): Promise<LaunchResult> {
 		const agentId = crypto.randomUUID();
 		return traced("orchestrator.launch", { "agent.id": agentId }, async () => {
 			await this.ctx.storage.put(`${AGENT_PREFIX}${agentId}`, { createdAt: Date.now() });
 			const agent = await getAgentByName(this.env.PI_AGENT, agentId);
-			const { operationId } = await agent.launch(prompt);
-			return { agentId, operationId };
+			const { operationId, seeded } = await agent.launch(prompt, options);
+			return { agentId, operationId, seeded };
 		});
 	}
 
@@ -76,6 +76,32 @@ export class Orchestrator extends DurableAgent<Env> {
 		const agent = await this.findAgent(agentId);
 		if (!agent) throw new Error(`Agent ${agentId} not found`);
 		return agent.armDemoDeadline(seconds);
+	}
+
+	async sendMessage(agentId: string, prompt: string, options: MessageOptions) {
+		return (await this.requireAgent(agentId)).sendMessage(prompt, options);
+	}
+
+	async continueRun(agentId: string) {
+		return (await this.requireAgent(agentId)).continueRun();
+	}
+
+	async forkSession(agentId: string, prompt?: string, note?: string) {
+		return (await this.requireAgent(agentId)).forkSession(prompt, note);
+	}
+
+	async answerWait(agentId: string, key: string, decision: WaitDecision) {
+		return (await this.requireAgent(agentId)).answerWait(key, decision);
+	}
+
+	async reconnectMcp(agentId: string, serverId: string) {
+		return (await this.requireAgent(agentId)).reconnectMcp(serverId);
+	}
+
+	private async requireAgent(agentId: string) {
+		const agent = await this.findAgent(agentId);
+		if (!agent) throw new Error(`Agent ${agentId} not found`);
+		return agent;
 	}
 
 	async listAgents(): Promise<Array<{ name: string; createdAt: number }>> {

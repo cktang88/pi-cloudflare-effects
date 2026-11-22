@@ -13,6 +13,7 @@ export interface RunResult {
 export interface LaunchResult {
 	agentId: string;
 	operationId: string;
+	seeded: boolean;
 }
 
 export interface AgentStatus {
@@ -33,7 +34,49 @@ export interface AgentEvent {
 	details?: Record<string, string | number | boolean>;
 }
 
-export type DemoInterrupt = "deadline" | "runtime-crash";
+export type DemoInterrupt = "deadline" | "runtime-crash" | "abort-all";
+
+/** One message of an existing conversation to start a new agent from (Pi 1.6 `init`). */
+export interface HistoryItem {
+	role: "user" | "assistant";
+	text: string;
+}
+
+export interface AgentSettings {
+	/** Hold exec, delete, and container_exec calls until a person allows them. */
+	approvals: boolean;
+	/** How long ask_human and approvals wait for a person before the deadline passes. */
+	replyMinutes: number;
+}
+
+export interface LaunchOptions {
+	history?: readonly HistoryItem[];
+	approvals?: boolean;
+	replyMinutes?: number;
+}
+
+export interface MessageOptions {
+	mode: "queue" | "steer";
+	keep: boolean;
+}
+
+export interface WaitDecision {
+	text?: string;
+	decision?: "allow" | "deny";
+}
+
+/** A tool call parked on a person, a deadline, or another session. */
+export interface WaitView {
+	key: string;
+	taskId: string;
+	kind: "question" | "approval" | "timer" | "subagent";
+	tool: string;
+	prompt: string;
+	status: "waiting" | "answered" | "expired" | "cancelled";
+	createdAt: string;
+	until?: string;
+	answer?: string;
+}
 
 export interface TranscriptItem {
 	id: string;
@@ -45,6 +88,8 @@ export interface ToolCallView {
 	name: string;
 	status: string;
 	nested?: boolean;
+	/** Pi 1.6: the call is parked (sleeping on a signal or deadline, or waiting on child tasks). */
+	parked?: boolean;
 	output?: string;
 	diagnostics?: unknown[];
 }
@@ -74,6 +119,8 @@ export interface AgentInspection {
 		tasks: Array<{ id: string; kind: string; conversationId: string; owner?: string; status: string; background: boolean; abortRequested: boolean }>;
 		pending: Array<{ operationId: string; session: string; status: string }>;
 		transcript: TranscriptItem[];
+		waits: WaitView[];
+		settings: AgentSettings;
 		live: {
 			generation: { attempt: number; retry?: { at: number; error: string }; deferred?: { pollAt: number } } | null;
 			run: { turns: number } | null;
@@ -90,7 +137,7 @@ export interface AgentInspection {
 		recentTools: Array<{ name: string; arguments?: string; result?: string; isError?: boolean }>;
 		workspaceFiles: Array<{ path: string; type: "file" | "dir" }>;
 		artifactRepos: Array<{ name: string; description?: string }>;
-		mcpServers: Array<{ id: string; name: string; endpoint: string; state: string; error?: string }>;
+		mcpServers: Array<{ id: string; name: string; endpoint: string; state: string; error?: string; authUrl?: string }>;
 		inspectionErrors: string[];
 		browser: { name: string; recentCalls: Array<{ arguments?: string; result?: string; isError?: boolean }> };
 		sandbox: { containerRunning: boolean; snapshotAvailable: boolean; snapshotName?: string; snapshotSize?: number };

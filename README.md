@@ -29,7 +29,38 @@ Each agent started over HTTP is its own Durable Object. The `delegate` tool star
 
 `PiHarness` is in beta ([docs](https://developers.cloudflare.com/agents/harnesses/pi/)). The agent gives it a function that opens Pi. That function installs the tools and system prompt, and passes `PiHarness`'s `onWake` to `Harness.open`, so the object can sleep while Pi waits on a retry. Tool parameters are JSON Schema built with `@earendil-works/pi-schema`. Pi's error reports (storage failures, tasks that crashed or were cut off) are logged as `pi.report`.
 
-`agents` 0.33 works with Pi 1.5 only. Pi 1.5 saves conversations in a format Pi 1.4 can't read, so fix a bad deploy by deploying forward, not by rolling back.
+`agents` 0.34 works with Pi 1.6 only (`~1.6.0`). Pi 1.6 stores tool calls (`pi.tool` v4) and model requests (`pi.generation` v3) that Pi 1.5 can't run, so once a conversation has run on this version, an older deploy can't continue it. Fix a bad deploy by deploying forward, not by rolling back.
+
+Agents 0.34 creates the root session on first use instead of when Pi opens. `launch()` calls `harness.root()` itself before the first submit, so a new agent can start from an existing history.
+
+### Tools that wait (Pi 1.6)
+
+A Pi 1.6 tool can return a park (`{ sleep: { signals, until } }`) instead of a result. A parked call holds no invocation, so the Durable Object can hibernate; one parked on a signal alone doesn't even set an alarm. `PiHarness.signal()` delivers a value and arms the wake job first (`harness.pi().signal()` doesn't, so it isn't used).
+
+| Feature | How it is built |
+| --- | --- |
+| `ask_human` | Parks on the `app.human-answer` signal with a deadline (memoized with `api.memo`, so a rerun keeps it). The Event Lab shows the question; your answer goes through `POST /agents/:id/answer` → `harness.signal()`. After the deadline the tool tells the model it got no answer. |
+| `wait` | Parks on a deadline only (`{ sleep: { until } }`). The object sleeps until PiHarness's wake job brings it back. |
+| `delegate` | Submits the task to a child conversation with `notify: { taskId, key }` and parks on `SubmissionSettled.key("answered")`. The settled record arrives when the call wakes; nothing holds a process while the subagent works. |
+| Approval gate | A `beforeTool` hook on `ToolTask`. With approvals on, `exec`, `delete`, and `container_exec` park until a person allows or denies them (`app.approval` signal) or the reply deadline passes, which refuses the call. The hook reads the signal first and memoizes its deadline, because Pi reruns it on every wake and reopen. |
+| `cancel()` | `ask_human`, `wait`, and `delegate` define `cancel`, which runs when a parked call is aborted and marks its wait cancelled. |
+
+Each parked call is also written to an `agent_waits` table, keyed by task and signal key, so the page can list and answer it. The writes are idempotent, because a tool or gate may run again.
+
+### Sessions and inputs
+
+- **Seeded history:** `POST /agents` takes `history`, a list of `{ role: "user" | "assistant", text }`. `launch()` passes it to `harness.root({ init })`, which writes the messages (`UserEntry`, `AssistantEntry`, with zero usage) in the commit that creates the root session.
+- **Fork:** `POST /agents/:id/fork` calls `sessions.fork("1", { init })`. An optional note is seeded into the branch; an optional prompt is answered there and recorded as an event.
+- **Follow-up messages:** `POST /agents/:id/message` submits with `whenBusy: "steer"` (join the running work) or queues it, and with `keep: true` sets `onAbort: "keep"`, so the message stays queued when everything else is aborted.
+- **Abort all:** `{"cause":"abort-all"}` calls `abort()` with no operation, which withdraws everything except kept inputs.
+- **Continue:** `POST /agents/:id/continue` calls `continue()` to answer the existing transcript again, for example after a run ended with `turn_limit`.
+
+### Other Agents 0.34 changes used here
+
+- `onFetchError(request, error)` on `PiAgent` chooses the response when a request or WebSocket upgrade fails. Agents no longer sends stacks; this app returns the message only and records `agent.fetch.failed`.
+- A failed MCP server stays failed until `reconnectMcpServer(id)`. The Tools tab has a **Reconnect** button (`POST /agents/:id/mcp-reconnect`) and shows an **Authorize again** link when a server needs the user to sign in again.
+- `generate_image` lists the FLUX.2 models (`flux-2-klein-4b`, `flux-2-klein-9b`, `flux-2-dev`) that pi-ai's `ai.images()` now supports.
+- pi-ai counts reasoning and cached tokens reported at the top level of `usage`; the Model tab shows them.
 
 ### Workspace tools
 
@@ -65,7 +96,10 @@ Agent runs and launches, tool calls, and the orchestrator's launch, run, status,
 - Run `code_mode` scripts that combine workspace, web, and MCP calls.
 - Generate images with Workers AI.
 - Run commands in a Linux container.
-- Hand a focused task to a subagent with `delegate`.
+- Hand a focused task to a subagent with `delegate`, without staying awake while it works.
+- Ask the person a question with `ask_human`, or pause with `wait`, and sleep until the answer or the deadline.
+- Hold risky tool calls for a person's approval.
+- Start from an existing conversation, or fork its conversation to try a different branch.
 
 ## Run locally
 
@@ -103,7 +137,7 @@ Deploy with `npx wrangler deploy`. The HTTP API has no authentication, so put ac
 This repository's `.npmrc` sets `min-release-age=0`, so npm installs new releases right away. It applies only here. `package.json` has two overrides:
 
 - `undici` inside `guarded-fetch` is raised to a patched 7.x release. `guarded-fetch` comes from `just-bash`, which the worker shell needs.
-- `ws` is pinned to 8.21.0, the exact version Chord 1.5 asks for, so `npm ci` accepts the lockfile.
+- `ws` is pinned to 8.21.0, the version Chord asked for at 1.5. If `npm install` reports a conflict with Chord 1.6, change the pin to the version Chord 1.6 asks for.
 
 ## Event Lab
 
@@ -112,8 +146,10 @@ The home page runs one agent and shows what it does:
 1. Start the warehouse task. The agent writes a restock plan to the workspace.
 2. Watch the event log and the answer. The page's WebSocket receives Pi's conversation state (recent transcript, the answer as it streams, running tools, and why a run ended without an answer) every time it changes. The agent also saves its last 300 events and sends them again when the page reconnects.
 3. Disconnect the page while the run is going, then reconnect. The run doesn't depend on the page.
-4. Schedule an abort five seconds out, or abort now. Both call `PiHarness.abort()`. The scheduled abort is saved with the agent, so it still fires after a restart.
-5. Restart the Durable Object mid-run. Pi reloads the saved conversation and continues the same run. A model answer that was cut off mid-stream counts as a failed attempt and is retried after Pi's backoff. **Resume run** checks that Pi still has the run and reconnects the page; it doesn't send the prompt again.
+4. Pick a sample task under **Launch options**: one asks you a question and then waits, one hands work to a subagent, and one runs a command that needs your approval. Answer or approve under **Needs you**; the countdown shows the reply deadline. While a call is parked, the agent can sleep.
+5. Send a follow-up message (queued, or steering the running work, optionally kept through **Abort all**), continue a run that ended unanswered, or fork the conversation.
+6. Schedule an abort five seconds out, or abort now. Both call `PiHarness.abort()`. The scheduled abort is saved with the agent, so it still fires after a restart.
+7. Restart the Durable Object mid-run. Pi reloads the saved conversation and continues the same run. A model answer that was cut off mid-stream counts as a failed attempt and is retried after Pi's backoff. **Resume run** checks that Pi still has the run and reconnects the page; it doesn't send the prompt again.
 
 The **Model** tab shows the model, sessions, running tasks, queued prompts, token usage, context compactions, how many tool rounds the current run has taken (or why the last one ended without an answer), and the recent transcript. The **Tools** tab shows each tool and whether it may run again after a restart, calls in progress (including calls made from `code_mode`), finished calls, up to 100 workspace paths, Artifacts repositories, MCP servers and their connection state, recent browser calls, and the container snapshot. Whether a particular interrupted call actually runs again depends on where the restart cut it off.
 
@@ -133,11 +169,11 @@ curl -X POST http://localhost:8787/agents \
   -d '{"prompt":"Inspect the project and summarize its structure."}'
 ```
 
-The `202` response has an `agentId` and an `operationId`. The run continues after the response is sent.
+The `202` response has an `agentId`, an `operationId`, and `seeded` (whether a `history` was written). The run continues after the response is sent.
 
 | Request | Result |
 | --- | --- |
-| `POST /agents` with `{"prompt":"..."}` | Start a new agent and return its IDs |
+| `POST /agents` with `{"prompt":"...", "history"?: [...], "approvals"?: true, "replyMinutes"?: 15}` | Start a new agent and return its IDs; `history` seeds its first session |
 | `GET /agents` | List agent IDs and when they were created |
 | `GET /agents/:id` | Status, and the latest answer or error |
 | `GET /agents/:id/events` (localhost only) | The agent's saved events |
@@ -147,6 +183,12 @@ The `202` response has an `agentId` and an `operationId`. The run continues afte
 | `POST /agents/:id/interrupt` with `{"cause":"runtime-crash"}` (localhost only) | Restart the Durable Object; Pi continues the current run |
 | `POST /agents/:id/resume` (localhost only) | Report whether Pi still has the current run in progress; doesn't resend the prompt |
 | `POST /agents/:id/deadline` with `{"seconds":5}` (localhost only) | Abort the current run after that many seconds (1 to 300) |
+| `POST /agents/:id/interrupt` with `{"cause":"abort-all"}` (localhost only) | Abort everything except messages sent with `keep` |
+| `POST /agents/:id/message` with `{"prompt":"...","mode":"queue"\|"steer","keep":false}` (localhost only) | Send a follow-up message |
+| `POST /agents/:id/continue` (localhost only) | Answer the existing transcript again without a new message |
+| `POST /agents/:id/fork` with `{"prompt"?:"...","note"?:"..."}` (localhost only) | Fork the root session, optionally ask the fork |
+| `POST /agents/:id/answer` with `{"key":"...","text":"..."}` or `{"key":"...","decision":"allow"\|"deny"}` (localhost only) | Answer a parked `ask_human` call or approval with `harness.signal()` |
+| `POST /agents/:id/mcp-reconnect` with `{"serverId":"..."}` (localhost only) | Reconnect a failed MCP server |
 | WebSocket `/agents/pi-agent/:id` (localhost only) | Saved events, then live events and conversation state |
 
 Statuses are `idle`, `running`, `complete`, and `failed`. Prompts must be non-empty strings.

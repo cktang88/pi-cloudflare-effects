@@ -2,7 +2,7 @@ import { routeAgentRequest } from "agents";
 import { Schema } from "effect";
 import { errorMessage } from "./observability";
 import { Orchestrator } from "./orchestrator";
-import { DeadlineInput, InterruptInput, RunInput } from "./schemas";
+import { AnswerInput, DeadlineInput, ForkInput, InterruptInput, LaunchInput, McpReconnectInput, MessageInput, RunInput } from "./schemas";
 import type { Env } from "./types";
 import { PiAgent } from "./worker-agent";
 
@@ -23,10 +23,14 @@ export default {
 		const orchestrator = env.ORCHESTRATOR.get(env.ORCHESTRATOR.idFromName("main"));
 
 		if (url.pathname === "/agents" && request.method === "POST") {
-			const input = await readBody(request, decodeRunInput);
+			const input = await readBody(request, decodeLaunchInput);
 			if (input instanceof Response) return input;
 			try {
-				return json(await orchestrator.launch(input.prompt), 202);
+				return json(await orchestrator.launch(input.prompt, {
+					...(input.history?.length ? { history: input.history.slice(0, 200) } : {}),
+					...(input.approvals !== undefined ? { approvals: input.approvals } : {}),
+					...(input.replyMinutes !== undefined ? { replyMinutes: input.replyMinutes } : {}),
+				}), 202);
 			} catch (error) {
 				return errorResponse(error);
 			}
@@ -40,10 +44,10 @@ export default {
 			}
 		}
 
-		const match = /^\/agents\/([a-f0-9-]+)(?:\/(run|events|inspect|interrupt|deadline|resume))?$/.exec(url.pathname);
+		const match = /^\/agents\/([a-f0-9-]+)(?:\/(run|events|inspect|interrupt|deadline|resume|message|continue|fork|answer|mcp-reconnect))?$/.exec(url.pathname);
 		if (!match) return json({ error: "Not found" }, 404);
 		const [, agentId, action] = match;
-		if ((action === "events" || action === "inspect" || action === "interrupt" || action === "deadline" || action === "resume") && !isLocalDemoRequest(url.hostname)) {
+		if (action && action !== "run" && !isLocalDemoRequest(url.hostname)) {
 			return json({ error: "Demo inspection is available on localhost only" }, 403);
 		}
 
@@ -79,6 +83,37 @@ export default {
 				return json(await orchestrator.resumeDemoRun(agentId));
 			}
 
+			if (request.method === "POST" && action === "message") {
+				const input = await readBody(request, decodeMessageInput);
+				if (input instanceof Response) return input;
+				return json(await orchestrator.sendMessage(agentId, input.prompt, { mode: input.mode, keep: input.keep }), 202);
+			}
+
+			if (request.method === "POST" && action === "continue") {
+				return json(await orchestrator.continueRun(agentId), 202);
+			}
+
+			if (request.method === "POST" && action === "fork") {
+				const input = await readBody(request, decodeForkInput);
+				if (input instanceof Response) return input;
+				return json(await orchestrator.forkSession(agentId, input.prompt?.trim() || undefined, input.note?.trim() || undefined), 202);
+			}
+
+			if (request.method === "POST" && action === "answer") {
+				const input = await readBody(request, decodeAnswerInput);
+				if (input instanceof Response) return input;
+				return json(await orchestrator.answerWait(agentId, input.key, {
+					...(input.text !== undefined ? { text: input.text } : {}),
+					...(input.decision ? { decision: input.decision } : {}),
+				}));
+			}
+
+			if (request.method === "POST" && action === "mcp-reconnect") {
+				const input = await readBody(request, decodeMcpReconnectInput);
+				if (input instanceof Response) return input;
+				return json(await orchestrator.reconnectMcp(agentId, input.serverId));
+			}
+
 			if (request.method === "POST" && action === "deadline") {
 				const input = await readBody(request, decodeDeadlineInput);
 				if (input instanceof Response) return input;
@@ -93,6 +128,11 @@ export default {
 } satisfies ExportedHandler<Env>;
 
 const decodeRunInput = Schema.decodeUnknownSync(RunInput);
+const decodeLaunchInput = Schema.decodeUnknownSync(LaunchInput);
+const decodeMessageInput = Schema.decodeUnknownSync(MessageInput);
+const decodeForkInput = Schema.decodeUnknownSync(ForkInput);
+const decodeAnswerInput = Schema.decodeUnknownSync(AnswerInput);
+const decodeMcpReconnectInput = Schema.decodeUnknownSync(McpReconnectInput);
 const decodeInterruptInput = Schema.decodeUnknownSync(InterruptInput);
 const decodeDeadlineInput = Schema.decodeUnknownSync(DeadlineInput);
 

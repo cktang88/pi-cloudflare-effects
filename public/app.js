@@ -10,6 +10,15 @@ let pollController;
 let connectionGeneration = 0;
 let currentStatus = "";
 let requestBusy = false;
+const waitRows = new Map();
+let waitTimer;
+
+const PRESETS = {
+  restock: "You are helping a small warehouse. A shipment arrived with 8 desk lamps and 3 keyboards. Current stock is 2 desk lamps and 5 keyboards. The target stock is 6 lamps and 4 keyboards. Use the workspace tools to write /restock-plan.md with the quantities to reorder and a short explanation. Then report the file you created and the reorder quantities.",
+  ask: "Plan a restock for a small warehouse. Before writing anything, use ask_human to ask me which supplier to use and how many days until delivery. Then use wait for 20 seconds (pretend you are giving the supplier time to confirm), and write /restock-plan.md with my answers included. Report what you wrote.",
+  delegate: "Use delegate to have a subagent write a three-bullet checklist for receiving a warehouse shipment. Then save the subagent's checklist to /receiving-checklist.md and report it.",
+  approval: "Use exec to run `ls -la / && date` in the workspace shell, then write the output to /listing.txt and summarize it. If a call is refused, say so.",
+};
 
 function showError(title, message) {
   addEvent({ id: crypto.randomUUID(), at: new Date().toISOString(), type: title, level: "error", details: { message: String(message || "Unknown error") } });
@@ -120,7 +129,7 @@ function renderPiView(view) {
     addEvent({ id: streamingId, at, type: "Pi assistant message · saved to transcript", details: {}, preview: "" });
   }
   for (const [index, call] of (view.tools || []).entries()) {
-    addEvent({ id: `pi-tool-${connectionGeneration}-${call.nested ? "nested-" : ""}${index}-${call.name}`, at, type: `Tool ${call.nested ? "(nested) " : ""}${call.name} · ${call.status}`, details: call.output ? { output: call.output.slice(-1000) } : {} });
+    addEvent({ id: `pi-tool-${connectionGeneration}-${call.nested ? "nested-" : ""}${index}-${call.name}`, at, type: `Tool ${call.nested ? "(nested) " : ""}${call.name} · ${call.parked ? `parked (${call.status})` : call.status}`, level: call.parked ? "warn" : "info", details: call.output ? { output: call.output.slice(-1000) } : {} });
   }
   if (view.retry) addEvent({ id: `pi-retry-${view.retry.at}`, at, type: "Pi model request · retry scheduled", level: "warn", details: { at: new Date(view.retry.at).toISOString(), error: view.retry.error } });
   if (view.runFailure) addEvent({ id: `pi-run-failure-${connectionGeneration}-${view.runFailure.reason}`, at, type: `Pi run ended unanswered · ${view.runFailure.reason}`, level: "warn", details: view.runFailure.detail ? { detail: view.runFailure.detail } : {} });
@@ -137,7 +146,10 @@ function updateControls() {
   $("new-run").textContent = requestBusy ? "Starting…" : "New agent · fresh conversation";
   $("disconnect").disabled = !exists || !socket || socket.readyState !== WebSocket.OPEN;
   $("resume-run").disabled = requestBusy || !exists || Boolean(socket && [WebSocket.CONNECTING, WebSocket.OPEN].includes(socket.readyState));
-  for (const id of ["arm-timeout", "timeout", "crash"]) $(id).disabled = !active;
+  for (const id of ["arm-timeout", "timeout", "crash", "abort-all"]) $(id).disabled = !active;
+  $("send-message").disabled = requestBusy || !exists;
+  $("continue-run").disabled = requestBusy || !exists || active;
+  $("fork").disabled = requestBusy || !exists;
 }
 
 function setStatus(status) {
@@ -187,6 +199,8 @@ function renderInspection(data) {
   addStateCard(summary, "Sessions", `${(brain.sessions || []).length}${(brain.sessions || []).some((s) => s.busy) ? " · active" : ""}`);
   addStateCard(summary, "Queued", String((brain.pending || []).length));
   addStateCard(summary, "Generation", brain.live?.generation ? "working" : "idle");
+  addStateCard(summary, "Parked calls", String((brain.waits || []).filter((wait) => wait.status === "waiting").length));
+  renderWaits(brain.waits || []);
   const extra = $("brain-extra"); extra.replaceChildren();
   addStateCard(extra, "Provider", brain.model?.provider || "none");
   addStateCard(extra, "Thinking", brain.thinkingLevel || "default");
@@ -194,7 +208,8 @@ function renderInspection(data) {
   addStateCard(extra, "Compaction", (brain.live?.compactions || []).map((item) => `${item.trigger}${item.blocking ? " · blocking" : ""} · attempt ${item.attempt}`).join(", ") || (brain.live?.compactionFailure ? `last failed: ${brain.live.compactionFailure.error}` : "none active"));
   addStateCard(extra, "Pending submissions", (brain.pending || []).map((p) => `${p.status} · ${p.operationId}`).join("\n") || "none");
   addStateCard(extra, "Extensions", Array.isArray(brain.extensions) ? (brain.extensions.join(", ") || "host defaults") : JSON.stringify(brain.extensions));
-  addStateCard(extra, "Usage", JSON.stringify(brain.usage || {}));
+  addStateCard(extra, "Usage", formatUsage(brain.usage));
+  addStateCard(extra, "Approvals", brain.settings ? `${brain.settings.approvals ? "required for exec, delete, container_exec" : "off"} · reply deadline ${brain.settings.replyMinutes} min` : "default");
   const generation = brain.live?.generation;
   addStateCard(extra, "Generation", generation ? `attempt ${generation.attempt}${generation.retry ? ` · retry ${generation.retry.at}` : ""}${generation.deferred ? ` · deferred until ${generation.deferred.pollAt}` : ""}` : "idle");
   addStateCard(extra, "Run", brain.live?.run ? `${brain.live.run.turns} tool round(s)` : brain.live?.runFailure ? `last run unanswered · ${brain.live.runFailure.reason}${brain.live.runFailure.detail ? ` · ${brain.live.runFailure.detail}` : ""}` : "idle");
@@ -280,6 +295,16 @@ function renderInspection(data) {
     const state = document.createElement("span"); state.className = "pill"; state.textContent = item.state || "unknown";
     row.append(title, endpoint, state);
     if (item.error) { const error = document.createElement("span"); error.className = "detail"; error.textContent = item.error; row.append(error); }
+    if (item.authUrl) {
+      const link = document.createElement("a"); link.href = item.authUrl; link.target = "_blank"; link.rel = "noopener noreferrer"; link.textContent = "Authorize again ↗";
+      const wrap = document.createElement("span"); wrap.className = "detail"; wrap.append(link); row.append(wrap);
+    }
+    if (item.state === "failed" || item.error || item.authUrl) {
+      const buttons = document.createElement("div"); buttons.className = "buttons";
+      const reconnect = document.createElement("button"); reconnect.textContent = "Reconnect"; reconnect.title = "A failed server stays failed until it is reconnected (reconnectMcpServer)";
+      reconnect.addEventListener("click", () => reconnectMcp(item.id, reconnect));
+      buttons.append(reconnect); row.append(buttons);
+    }
     mcp.append(row);
   }
   if (!mcp.childElementCount) mcp.innerHTML = '<div class="empty">No MCP servers are configured on this agent.</div>';
@@ -302,6 +327,7 @@ function renderInspection(data) {
   for (const call of data.hands?.currentCalls || []) {
     const row = document.createElement("div"); row.className = "list-row";
     const title = document.createElement("strong"); title.textContent = `${call.nested ? "nested · " : ""}${call.name} · ${call.status}`; row.append(title);
+    if (call.parked) { const pill = document.createElement("span"); pill.className = "pill parked"; pill.textContent = "parked · holds no invocation"; row.append(pill); }
     if (call.output) { const output = document.createElement("pre"); output.textContent = call.output; row.append(output); }
     if (call.diagnostics?.length) { const diagnostics = document.createElement("pre"); diagnostics.textContent = JSON.stringify(call.diagnostics, null, 2); row.append(diagnostics); }
     calls.append(row);
@@ -317,6 +343,161 @@ function renderInspection(data) {
   addStateCard(hands, "Tools", String(loadedTools.length + nestedTools.length));
   addStateCard(hands, "Active calls", String((data.hands?.currentCalls || []).length));
   addStateCard(hands, "Browser calls", String((browser.recentCalls || []).length));
+}
+
+function formatUsage(usage) {
+  if (!usage || typeof usage !== "object") return "none yet";
+  const totals = usage.total || usage.totals || usage;
+  const parts = [];
+  for (const [key, label] of [["input", "input"], ["output", "output"], ["reasoning", "reasoning"], ["reasoningTokens", "reasoning"], ["cacheRead", "cached read"], ["cacheWrite", "cached write"], ["totalTokens", "total"]]) {
+    if (typeof totals[key] === "number") parts.push(`${label} ${totals[key].toLocaleString()}`);
+  }
+  const cost = typeof totals.cost === "number" ? totals.cost : totals.cost?.total;
+  if (typeof cost === "number" && cost > 0) parts.push(`$${cost.toFixed(4)}`);
+  return parts.length ? parts.join(" · ") : JSON.stringify(usage);
+}
+
+function timeLeft(until) {
+  const ms = new Date(until).getTime() - Date.now();
+  if (Number.isNaN(ms)) return "";
+  if (ms <= 0) return "deadline passed · waking";
+  const seconds = Math.ceil(ms / 1000);
+  if (seconds < 120) return `${seconds}s left`;
+  const minutes = Math.ceil(seconds / 60);
+  return minutes < 120 ? `${minutes} min left` : `${Math.round(minutes / 60)} h left`;
+}
+
+const WAIT_LABELS = { question: "Question for you", approval: "Approval needed", timer: "Waiting for a deadline", subagent: "Waiting for a subagent" };
+
+// Waiting rows are kept across refreshes, so text typed into an answer isn't wiped every second.
+function renderWaits(waits) {
+  const open = waits.filter((wait) => wait.status === "waiting");
+  const list = $("waits");
+  const openKeys = new Set(open.map((wait) => wait.key));
+  for (const [key, entry] of waitRows) if (!openKeys.has(key)) { entry.row.remove(); waitRows.delete(key); }
+  for (const wait of open) {
+    if (waitRows.has(wait.key)) { waitRows.get(wait.key).wait = wait; continue; }
+    list.querySelector(".empty")?.remove();
+    const row = document.createElement("div"); row.className = `list-row wait-row ${wait.kind}`;
+    const title = document.createElement("strong"); title.textContent = `${WAIT_LABELS[wait.kind] || wait.kind} · ${wait.tool}`;
+    const countdown = document.createElement("span"); countdown.className = "countdown detail";
+    const prompt = document.createElement("pre"); prompt.textContent = wait.prompt;
+    row.append(title, countdown, prompt);
+    if (wait.kind === "question") {
+      const answer = document.createElement("textarea"); answer.rows = 2; answer.placeholder = "Your answer"; answer.setAttribute("aria-label", `Answer to: ${wait.prompt.slice(0, 80)}`);
+      const buttons = document.createElement("div"); buttons.className = "buttons";
+      const send = document.createElement("button"); send.className = "primary"; send.textContent = "Send answer";
+      send.addEventListener("click", () => answerWait(wait.key, { text: answer.value }, [send]));
+      answer.addEventListener("keydown", (event) => { if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) send.click(); });
+      buttons.append(send); row.append(answer, buttons);
+    } else if (wait.kind === "approval") {
+      const note = document.createElement("input"); note.type = "text"; note.placeholder = "Note for the agent (optional)"; note.setAttribute("aria-label", "Note for the agent");
+      const buttons = document.createElement("div"); buttons.className = "buttons";
+      const allow = document.createElement("button"); allow.className = "primary"; allow.textContent = "Allow";
+      const deny = document.createElement("button"); deny.className = "danger"; deny.textContent = "Deny";
+      allow.addEventListener("click", () => answerWait(wait.key, { decision: "allow", text: note.value }, [allow, deny]));
+      deny.addEventListener("click", () => answerWait(wait.key, { decision: "deny", text: note.value }, [allow, deny]));
+      buttons.append(allow, deny); row.append(note, buttons);
+    } else {
+      const hint = document.createElement("span"); hint.className = "detail";
+      hint.textContent = wait.kind === "timer" ? "The call wakes on its own at the deadline." : "The call wakes when the subagent's answer settles (notify + SubmissionSettled).";
+      row.append(hint);
+    }
+    list.append(row); waitRows.set(wait.key, { row, countdown, wait });
+  }
+  if (!waitRows.size && !list.querySelector(".empty")) list.innerHTML = '<div class="empty">Nothing is waiting.</div>';
+  updateCountdowns();
+  $("waiting-badge").hidden = !open.some((wait) => wait.kind === "question" || wait.kind === "approval");
+  $("waiting-count").textContent = String(open.filter((wait) => wait.kind === "question" || wait.kind === "approval").length);
+  const history = $("wait-history"); history.replaceChildren();
+  for (const wait of waits) {
+    const row = document.createElement("div"); row.className = "list-row";
+    const title = document.createElement("strong"); title.textContent = `${wait.tool} · ${wait.kind}`;
+    const state = document.createElement("span"); state.className = `pill state-${wait.status}`; state.textContent = wait.status;
+    const detail = document.createElement("span"); detail.className = "detail";
+    detail.textContent = `task ${wait.taskId} · ${new Date(wait.createdAt).toLocaleTimeString()}${wait.until ? ` · deadline ${new Date(wait.until).toLocaleTimeString()}` : ""}${wait.answer ? ` · ${wait.answer}` : ""}`;
+    row.append(title, state, detail); history.append(row);
+  }
+  if (!history.childElementCount) history.innerHTML = '<div class="empty">No parked calls yet.</div>';
+  $("wait-history-count").textContent = String(waits.length);
+}
+
+function updateCountdowns() {
+  for (const { countdown, wait } of waitRows.values()) countdown.textContent = wait.until ? timeLeft(wait.until) : "no deadline · holds no alarm";
+}
+
+function resetWaits() {
+  waitRows.clear();
+  $("waits").innerHTML = '<div class="empty">Nothing is waiting.</div>';
+  $("waiting-badge").hidden = true;
+}
+
+async function answerWait(key, body, buttons) {
+  if (!agentId) return;
+  if (body.text !== undefined && !body.decision && !body.text.trim()) { showError("demo.answer.empty", "Type an answer first."); return; }
+  for (const button of buttons) button.disabled = true;
+  try {
+    const result = await requestJson(`/agents/${agentId}/answer`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ key, ...body }) });
+    if (result.result !== "delivered") addEvent({ id: crypto.randomUUID(), at: new Date().toISOString(), type: `demo.signal.${result.result}`, level: "warn", details: { key } });
+    if (pollController) await refreshInspection(pollController.signal, connectionGeneration);
+  } catch (error) {
+    showError("demo.answer.failed", error.message);
+    for (const button of buttons) button.disabled = false;
+  }
+}
+
+async function postAction(path, body, errorType) {
+  if (!agentId || requestBusy) return undefined;
+  requestBusy = true; updateControls();
+  try {
+    return await requestJson(`/agents/${agentId}/${path}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body ?? {}) });
+  } catch (error) {
+    showError(errorType, error.message);
+    return undefined;
+  } finally {
+    requestBusy = false; updateControls();
+  }
+}
+
+async function sendMessage() {
+  const prompt = $("message").value.trim();
+  if (!prompt) { showError("demo.message.empty", "Type a message first."); return; }
+  const mode = document.querySelector('input[name="mode"]:checked')?.value || "queue";
+  const result = await postAction("message", { prompt, mode, keep: $("keep").checked }, "demo.message.failed");
+  if (!result) return;
+  $("message").value = "";
+  setStatus({ status: "running", operationId: result.operationId });
+}
+
+async function continueRun() {
+  const result = await postAction("continue", {}, "demo.continue.failed");
+  if (result) setStatus({ status: "running", operationId: result.operationId });
+}
+
+async function forkSession() {
+  const result = await postAction("fork", { prompt: $("fork-prompt").value.trim(), note: $("fork-note").value.trim() }, "demo.fork.failed");
+  if (!result) return;
+  $("fork-prompt").value = ""; $("fork-note").value = "";
+  addEvent({ id: crypto.randomUUID(), at: new Date().toISOString(), type: "demo.fork.created", details: { session: result.sessionId, ...(result.operationId ? { operation: result.operationId } : {}) } });
+}
+
+async function reconnectMcp(serverId, button) {
+  button.disabled = true; button.textContent = "Reconnecting…";
+  const result = await postAction("mcp-reconnect", { serverId }, "demo.mcp.reconnect_failed");
+  if (result) addEvent({ id: crypto.randomUUID(), at: new Date().toISOString(), type: "demo.mcp.reconnected", details: { serverId, state: result.state } });
+}
+
+function parseHistory(text) {
+  const history = [];
+  for (const raw of text.split("\n")) {
+    const line = raw.trim();
+    if (!line) continue;
+    const match = /^(user|assistant)\s*:\s*(.*)$/i.exec(line);
+    if (match) history.push({ role: match[1].toLowerCase(), text: match[2] });
+    else if (history.length) history[history.length - 1].text += `\n${line}`;
+    else throw new Error("Each history line must start with User: or Assistant:");
+  }
+  return history.filter((item) => item.text.trim());
 }
 
 async function requestJson(path, options = {}, signal) {
@@ -379,8 +560,16 @@ async function launch() {
   if (requestBusy || activeRun()) return;
   requestBusy = true; $("launch").textContent = "Starting…"; $("new-run").textContent = "Starting…"; updateControls();
   try {
-    const result = await requestJson("/agents", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ prompt: $("prompt").value.trim() }) });
-    agentId = result.agentId; currentStatus = "running"; localStorage.setItem(agentStorageKey, agentId); eventRows.clear(); eventsEl.replaceChildren(); filterEvents();
+    const history = parseHistory($("history").value);
+    const replyMinutes = Number($("reply-minutes").value);
+    const body = {
+      prompt: $("prompt").value.trim(),
+      approvals: $("approvals").checked,
+      ...(Number.isInteger(replyMinutes) && replyMinutes >= 1 && replyMinutes <= 1440 ? { replyMinutes } : {}),
+      ...(history.length ? { history } : {}),
+    };
+    const result = await requestJson("/agents", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    agentId = result.agentId; currentStatus = "running"; localStorage.setItem(agentStorageKey, agentId); eventRows.clear(); eventsEl.replaceChildren(); filterEvents(); resetWaits();
     $("answer").textContent = "Waiting for a run to finish.";
     const code = document.createElement("code"); code.textContent = agentId; $("agent-id").replaceChildren(code);
     setStatus({ status: "running", operationId: result.operationId }); connect();
@@ -425,6 +614,17 @@ $("disconnect").addEventListener("click", () => socket?.close(1000, "Demo viewer
 $("timeout").addEventListener("click", () => interrupt("deadline"));
 $("arm-timeout").addEventListener("click", armDeadline);
 $("crash").addEventListener("click", () => interrupt("runtime-crash"));
+$("abort-all").addEventListener("click", () => interrupt("abort-all"));
+$("send-message").addEventListener("click", sendMessage);
+$("message").addEventListener("keydown", (event) => { if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) void sendMessage(); });
+$("continue-run").addEventListener("click", continueRun);
+$("fork").addEventListener("click", forkSession);
+$("preset").addEventListener("change", () => {
+  $("prompt").value = PRESETS[$("preset").value] || PRESETS.restock;
+  if ($("preset").value === "approval") $("approvals").checked = true;
+  $("prompt").closest("details").open = true;
+});
+waitTimer = setInterval(updateCountdowns, 1000);
 $("event-search").addEventListener("input", filterEvents);
 $("event-level").addEventListener("change", filterEvents);
 $("reset-event-filters").addEventListener("click", () => { $("event-search").value = ""; $("event-level").value = ""; filterEvents(); $("event-search").focus(); });

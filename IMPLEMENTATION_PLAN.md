@@ -10,7 +10,7 @@
 
 ## Done
 
-- Pinned the releases current on 2026-11-06: Pi Durable 1.5, Agents 0.33, Computer 0.10, Code Mode 0.5.6, Effect 4.1, AI SDK 7.0.163, Wrangler 4.158.
+- Pinned the releases current on 2026-11-06: Pi Durable 1.5, Agents 0.33 (upgraded on 2026-11-22 to Pi Durable 1.6 and Agents 0.34), Computer 0.10, Code Mode 0.5.6, Effect 4.1, AI SDK 7.0.163, Wrangler 4.158.
 - Each agent is a named `PiAgent` Durable Object. `PiHarness` from Agents stores Pi's data and resumes Pi after a restart.
 - `delegate` starts a subagent as a child conversation owned by the calling tool, and finds the same child if it runs again after a restart.
 - Computer's workspace tools go straight to Pi, each with its own rule for running again after a restart. The worker shell works: the Worker exports `WorkspaceServiceProxy` and the agent exposes `__getWorkspaceStub()`.
