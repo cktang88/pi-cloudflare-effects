@@ -44,7 +44,7 @@ export default {
 					...(input.replyMinutes !== undefined ? { replyMinutes: input.replyMinutes } : {}),
 				}), 202);
 			} catch (error) {
-				return errorResponse(error);
+				return errorResponse(error, url.hostname);
 			}
 		}
 
@@ -52,7 +52,7 @@ export default {
 			try {
 				return json({ agents: await orchestrator.listAgents() });
 			} catch (error) {
-				return errorResponse(error);
+				return errorResponse(error, url.hostname);
 			}
 		}
 
@@ -135,7 +135,7 @@ export default {
 				return json(await orchestrator.armDemoDeadline(agentId, input.seconds));
 			}
 		} catch (error) {
-			return errorResponse(error);
+			return errorResponse(error, url.hostname);
 		}
 
 		return json({ error: "Not found" }, 404);
@@ -181,8 +181,9 @@ function json(value: unknown, status = 200): Response {
 	return Response.json(value, { status });
 }
 
-function errorResponse(error: unknown): Response {
+/** Logs the full error; only the local Event Lab gets the message, like Agents 0.34's Lifecycle.fetch. */
+function errorResponse(error: unknown, hostname: string): Response {
 	const message = errorMessage(error);
 	console.error(JSON.stringify({ event: "request.failed", message }));
-	return json({ error: message }, 500);
+	return json({ error: isLocalDemoRequest(hostname) ? message : "Internal Server Error" }, 500);
 }

@@ -504,7 +504,12 @@ async function reconnectMcp(serverId, button) {
   const result = await postAction("mcp-reconnect", { serverId }, "demo.mcp.reconnect_failed");
   // The next inspection rebuilds the row; restore the button in case none comes (socket closed, or busy).
   button.disabled = false; button.textContent = "Reconnect";
-  if (result) addEvent({ id: crypto.randomUUID(), at: new Date().toISOString(), type: "demo.mcp.reconnected", details: { serverId, state: result.state } });
+  if (result) addEvent({
+    id: crypto.randomUUID(), at: new Date().toISOString(),
+    type: result.state === "failed" ? "demo.mcp.reconnect_failed" : "demo.mcp.reconnected",
+    level: result.state === "failed" ? "error" : result.state === "authenticating" ? "warn" : "info",
+    details: { serverId, state: result.state, ...(result.authUrl && isWebLink(result.authUrl) ? { authorize: result.authUrl } : {}), ...(result.error ? { error: result.error } : {}) },
+  });
 }
 
 function parseHistory(text) {

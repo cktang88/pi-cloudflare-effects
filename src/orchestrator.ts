@@ -10,8 +10,14 @@ export class Orchestrator extends DurableAgent<Env> {
 		return traced("orchestrator.launch", { "agent.id": agentId }, async () => {
 			await this.ctx.storage.put(`${AGENT_PREFIX}${agentId}`, { createdAt: Date.now() });
 			const agent = await getAgentByName(this.env.PI_AGENT, agentId);
-			const { operationId, seeded } = await agent.launch(prompt, options);
-			return { agentId, operationId, seeded };
+			try {
+				const { operationId, seeded } = await agent.launch(prompt, options);
+				return { agentId, operationId, seeded };
+			} catch (error) {
+				// Don't list an agent that never started (for example, a history the seed rejected).
+				await this.ctx.storage.delete(`${AGENT_PREFIX}${agentId}`);
+				throw error;
+			}
 		});
 	}
 

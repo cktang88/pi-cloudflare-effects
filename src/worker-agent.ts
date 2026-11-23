@@ -66,8 +66,6 @@ Save facts that will help later runs in /memory.md. Check each step before the n
 /** Computer tools that are safe to run again if a restart interrupts them (same list as the Agents Pi harness example). */
 const REPLAY_SAFE_WORKSPACE_TOOLS = new Set(["read", "ls", "find", "grep", "write", "delete"]);
 const MAX_EVENTS = 300;
-/** The root session's id in PiHarness. */
-const ROOT_SESSION = "1";
 /** Tools the approval gate holds until a person allows them, when approvals are on. */
 const APPROVAL_TOOLS = new Set(["exec", "delete", "container_exec"]);
 const DEFAULT_SETTINGS: AgentSettings = { approvals: false, replyMinutes: 15 };
@@ -268,6 +266,7 @@ export class PiAgent extends Agent<Env> {
 			// Not awaited: startup must not wait for the runs to finish.
 			for (const operationId of await this.trackedOperations()) void this.settleWhenDone(operationId);
 		}
+		for (const fork of (await this.ctx.storage.get<ForkOperation[]>("agent:forks")) ?? []) void this.settleFork(fork);
 		// Sockets stay open while the object hibernates; give each one a new watch.
 		for (const connection of this.getConnections()) await this.watchView(connection);
 	}
@@ -284,9 +283,16 @@ export class PiAgent extends Agent<Env> {
 	 */
 	async onFetchError(request: Request, error: unknown): Promise<Response> {
 		const message = errorMessage(error);
+		const url = new URL(request.url);
 		const upgrade = request.headers.get("Upgrade")?.toLowerCase() === "websocket";
-		await this.recordEvent("agent.fetch.failed", { path: new URL(request.url).pathname, upgrade, message: message.slice(0, 500) }, "error").catch(() => undefined);
-		return Response.json({ error: upgrade ? "The agent could not open its event stream" : "The agent could not handle this request", message: message.slice(0, 500) }, { status: 500 });
+		const local = url.hostname === "localhost" || url.hostname === "127.0.0.1" || url.hostname === "[::1]";
+		// The full error goes to the log and the event log; only the local Event Lab gets the message back.
+		console.error(JSON.stringify({ event: "agent.fetch.failed", agentId: this.name, path: url.pathname, upgrade, error: message }));
+		await this.recordEvent("agent.fetch.failed", { path: url.pathname, upgrade, message: message.slice(0, 500) }, "error").catch(() => undefined);
+		return Response.json({
+			error: upgrade ? "The agent could not open its event stream" : "The agent could not handle this request",
+			...(local ? { message: message.slice(0, 500) } : {}),
+		}, { status: 500 });
 	}
 
 	async onConnect(connection: Connection): Promise<void> {
@@ -478,27 +484,38 @@ export class PiAgent extends Agent<Env> {
 	 * fork. The fork's answer is recorded as an event; the root conversation is unchanged.
 	 */
 	async forkSession(prompt: string | undefined, note: string | undefined): Promise<{ sessionId: string; operationId?: string }> {
-		const forked = await this.piHarness.sessions.fork(ROOT_SESSION, note
+		// root() returns the existing root (created: false) and its handle, so its id isn't assumed.
+		const { session: root } = await this.piHarness.root({});
+		const from = String(root.id);
+		const forked = await this.piHarness.sessions.fork(root.id, note
 			? { init: seedHistory([{ role: "user", text: `Note for this branch: ${note}` }, { role: "assistant", text: "Understood." }], this.ai(this.env.MODEL_ID ?? DEFAULT_MODEL)) }
 			: {});
-		const session = sessionHandle(forked);
-		const sessionId = String(session.id);
-		await this.recordEvent("agent.session.forked", { from: ROOT_SESSION, sessionId, ...(note ? { note: note.slice(0, 200) } : {}) });
+		const sessionId = forkedSessionId(forked);
+		await this.recordEvent("agent.session.forked", { from, sessionId, ...(note ? { note: note.slice(0, 200) } : {}) });
 		if (!prompt) return { sessionId };
 		const operationId = crypto.randomUUID();
-		await session.submit(prompt, { operationId });
-		this.ctx.waitUntil((async () => {
-			try {
-				const result = await session.wait(operationId);
-				await this.recordEvent(result.status === "done" ? "agent.fork.answered" : "agent.fork.unanswered", {
-					sessionId,
-					...(result.status === "done" ? { text: (result.text ?? "").slice(0, 2_000) } : { reason: result.reason ?? "unknown" }),
-				}, result.status === "done" ? "info" : "warn", operationId);
-			} catch (error) {
-				await this.recordEvent("agent.fork.failed", { sessionId, message: errorMessage(error) }, "error", operationId);
-			}
-		})());
+		await this.piHarness.session(sessionId).submit(prompt, { operationId });
+		// Kept in storage so onStart settles it again if the object is evicted first.
+		const forks = (await this.ctx.storage.get<ForkOperation[]>("agent:forks")) ?? [];
+		await this.ctx.storage.put("agent:forks", [...forks, { sessionId, operationId }]);
+		void this.settleFork({ sessionId, operationId });
 		return { sessionId, operationId };
+	}
+
+	private async settleFork(fork: ForkOperation): Promise<void> {
+		try {
+			const result = await this.piHarness.session(fork.sessionId).wait(fork.operationId);
+			const forks = (await this.ctx.storage.get<ForkOperation[]>("agent:forks")) ?? [];
+			// Recorded once: a second settle (after a restart) finds the fork gone.
+			if (!forks.some((item) => item.operationId === fork.operationId)) return;
+			await this.ctx.storage.put("agent:forks", forks.filter((item) => item.operationId !== fork.operationId));
+			await this.recordEvent(result.status === "done" ? "agent.fork.answered" : "agent.fork.unanswered", {
+				sessionId: fork.sessionId,
+				...(result.status === "done" ? { text: (result.text ?? "").slice(0, 2_000) } : { reason: result.reason ?? "unknown" }),
+			}, result.status === "done" ? "info" : "warn", fork.operationId);
+		} catch (error) {
+			console.warn(JSON.stringify({ event: "agent.fork.settle_failed", agentId: this.name, ...fork, error: errorMessage(error) }));
+		}
 	}
 
 	/** Delivers a person's answer or approval decision to a parked call with `PiHarness.signal()`. */
@@ -529,12 +546,20 @@ export class PiAgent extends Agent<Env> {
 	}
 
 	/** Agents 0.34: a failed MCP server stays failed until it is reconnected. */
-	async reconnectMcp(serverId: string): Promise<{ state: string } | RequestFailure> {
-		if (!this.mcp.listServers().some((server) => server.id === serverId)) return { error: "No MCP server with that id", status: 404 };
-		await this.reconnectMcpServer(serverId);
-		const state = this.mcp.mcpConnections[serverId]?.connectionState ?? "not connected";
-		await this.recordEvent("agent.mcp.reconnect_requested", { serverId, state: String(state) });
-		return { state: String(state) };
+	async reconnectMcp(serverId: string): Promise<{ state: string; authUrl?: string; error?: string } | RequestFailure> {
+		if (!(serverId in this.getMcpServers().servers)) return { error: "No MCP server with that id", status: 404 };
+		try {
+			// Returns addMcpServer()'s result: ready, or authenticating with a new authorization link.
+			const result = await this.reconnectMcpServer(serverId);
+			const authUrl = result.state === "authenticating" ? safeLink(result.authUrl) : undefined;
+			await this.recordEvent("agent.mcp.reconnected", { serverId, state: result.state, ...(authUrl ? { authUrl } : {}) });
+			return { state: result.state, ...(authUrl ? { authUrl } : {}) };
+		} catch (error) {
+			// It throws when the attempt fails; the server stays failed until the next reconnect.
+			const message = errorMessage(error);
+			await this.recordEvent("agent.mcp.reconnect_failed", { serverId, message: message.slice(0, 500) }, "error");
+			return { state: "failed", error: message.slice(0, 500) };
+		}
 	}
 
 	/**
@@ -687,9 +712,12 @@ export class PiAgent extends Agent<Env> {
 			hooks: [hook(ToolTask, {
 				beforeTool: async (call, api, context) => {
 					if (!APPROVAL_TOOLS.has(call.name)) return undefined;
-					const { approvals, replyMinutes } = await this.settings();
-					if (!approvals) return undefined;
 					const signalKey = `approve-${call.id}`;
+					const settings = await this.settings();
+					// Pi reruns gates on every wake and reopen, so the decision to gate this call is memoized.
+					const approvals = await api.memo(`approvals.on.${signalKey}`, settings.approvals, context);
+					if (!approvals) return undefined;
+					const { replyMinutes } = settings;
 					const key = waitKey(api.taskId, signalKey);
 					const state = await api.readSignal(ApprovalDecision, signalKey, context);
 					const until = await api.memo(`approvals.until.${signalKey}`, api.now() + replyMinutes * 60_000, context);
@@ -1045,17 +1073,16 @@ export class PiAgent extends Agent<Env> {
 				recentTools,
 				workspaceFiles,
 				artifactRepos: artifactRepos.map(({ name, description }) => ({ name, ...(description ? { description } : {}) })),
-				mcpServers: servers.map((server) => {
-					const { id, name, server_url } = server;
-					const connection = this.mcp.mcpConnections[id];
-					// Agents 0.34: a server that needs the user to authorize again carries a link.
-					const authUrl = safeLink((server as { auth_url?: string | null }).auth_url);
+				mcpServers: Object.entries(this.getMcpServers().servers).map(([id, server]) => {
+					// getMcpServers() is the documented view: state, error, and (Agents 0.34) the
+					// authorization link of a server that needs the user to sign in again.
+					const authUrl = safeLink(server.auth_url);
 					return {
 						id,
-						name,
-						endpoint: safeMcpEndpoint(server_url),
-						state: connection?.connectionState ?? "not connected",
-						...(connection?.connectionError ? { error: connection.connectionError } : {}),
+						name: server.name,
+						endpoint: safeMcpEndpoint(server.server_url),
+						state: server.state,
+						...(server.error ? { error: server.error } : {}),
 						...(authUrl ? { authUrl } : {}),
 					};
 				}),
@@ -1354,16 +1381,20 @@ function seedHistory(history: readonly HistoryItem[], model: { api: string; prov
 	};
 }
 
-type ForkedSession = {
-	id: unknown;
-	submit(input: string, options: { operationId: string }): Promise<unknown>;
-	wait(operationId: string): Promise<{ status: string; text?: string; reason?: string }>;
-};
+interface ForkOperation {
+	sessionId: string;
+	operationId: string;
+}
 
-/** `sessions.fork()` gives a session handle (or `{ session }`, as `root()` does). */
-function sessionHandle(value: unknown): ForkedSession {
-	const candidate = value as { session?: ForkedSession } & ForkedSession;
-	return candidate.session ?? candidate;
+/**
+ * The new session's id from `sessions.fork()`. The docs don't show its return shape: it is
+ * read as a session handle, or as `{ session }` like `root()`. Check with `npm run typecheck`.
+ */
+function forkedSessionId(value: unknown): string {
+	const candidate = value as { id?: unknown; session?: { id?: unknown } };
+	const id = candidate.session?.id ?? candidate.id;
+	if (id === undefined) throw new Error("sessions.fork() returned no session id");
+	return String(id);
 }
 
 /** A link the page may show: http(s) only, so a server row can't smuggle in a javascript: URL. */
