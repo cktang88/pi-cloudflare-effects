@@ -11,6 +11,7 @@ let connectionGeneration = 0;
 let currentStatus = "";
 let requestBusy = false;
 const waitRows = new Map();
+const mcpAlerted = new Set();
 let waitTimer;
 
 const PRESETS = {
@@ -300,6 +301,8 @@ function renderInspection(data) {
       const wrap = document.createElement("span"); wrap.className = "detail"; wrap.append(link); row.append(wrap);
     }
     if (item.state === "failed" || item.error || item.authUrl) {
+      // Open the collapsed group once per server, so a server that needs action is noticed.
+      if (!mcpAlerted.has(item.id)) { mcpAlerted.add(item.id); mcp.closest("details")?.setAttribute("open", ""); }
       const buttons = document.createElement("div"); buttons.className = "buttons";
       const reconnect = document.createElement("button"); reconnect.textContent = "Reconnect"; reconnect.title = "A failed server stays failed until it is reconnected (reconnectMcpServer)";
       reconnect.addEventListener("click", () => reconnectMcp(item.id, reconnect));
