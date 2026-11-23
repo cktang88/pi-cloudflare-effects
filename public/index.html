@@ -138,7 +138,7 @@
           <label class="check"><input id="approvals" type="checkbox"> <span>Require approval for <code>exec</code>, <code>delete</code>, and <code>container_exec</code></span></label>
           <label for="reply-minutes">Reply deadline (minutes)</label>
           <input id="reply-minutes" type="number" min="1" max="1440" value="15">
-          <p class="hint">After the deadline, <code>ask_human</code> continues without an answer and an unapproved call is refused. Until then the call is parked and the Durable Object can sleep.</p>
+          <p class="hint">After the deadline, <code>ask_human</code> continues without an answer and an unapproved call is refused. Until then the call is parked: it runs nothing, so the Durable Object can hibernate once no page is watching it.</p>
           <label for="history">Start from an existing history (optional)</label>
           <textarea id="history" rows="5" placeholder="User: We sell lamps and keyboards.&#10;Assistant: Got it. What should I plan?&#10;User: Keep at least 4 of each."></textarea>
           <p class="hint">One message per line, starting with <code>User:</code> or <code>Assistant:</code>. A new agent's first session is created with this transcript (<code>harness.root({ init })</code>) before the prompt is sent.</p>
@@ -146,21 +146,21 @@
 
         <div class="runbook-row">
         <section id="needs-you" class="needs-you" aria-labelledby="needs-you-title">
-          <span class="section-kicker">04 / Needs you</span>
+          <span class="section-kicker">03 / Needs you</span>
           <h3 id="needs-you-title">Parked calls</h3>
-          <p class="panel-intro">Tool calls waiting for a person, a deadline, or a subagent. While parked they hold no invocation, so the agent can sleep. Your answer is delivered with <code>harness.signal()</code>.</p>
+          <p class="panel-intro">Tool calls waiting for a person, a deadline, or a subagent. A parked call runs nothing, so the agent can hibernate once no page is watching it (this page polls while open). Your answer is delivered with <code>harness.signal()</code>.</p>
           <div id="waits" class="list waits"><div class="empty">Nothing is waiting.</div></div>
         </section>
 
         <section class="conversation-controls" aria-labelledby="talk-title">
-          <span class="section-kicker">05 / Conversation</span>
+          <span class="section-kicker">04 / Conversation</span>
           <h3 id="talk-title">Send, continue, or fork</h3>
           <label for="message">Message</label>
           <textarea id="message" rows="3" placeholder="Also reorder 2 monitors."></textarea>
-          <div class="segmented" role="radiogroup" aria-label="When the agent is busy">
+          <fieldset class="segmented"><legend class="sr-only">When the agent is busy</legend>
             <label class="check"><input type="radio" name="mode" value="queue" checked> Queue as its own run</label>
             <label class="check"><input type="radio" name="mode" value="steer"> Steer the running work</label>
-          </div>
+          </fieldset>
           <label class="check"><input id="keep" type="checkbox"> <span>Keep through “Abort all” (<code>onAbort: "keep"</code>)</span></label>
           <div class="buttons">
             <button id="send-message" class="primary" disabled>Send message</button>
@@ -168,7 +168,7 @@
           </div>
           <details class="task-editor"><summary><span aria-hidden="true">⑂</span> Fork the conversation</summary>
             <label for="fork-note">Note for the branch (seeded with <code>init</code>)</label>
-            <input id="fork-note" type="text" placeholder="Assume the supplier is out of keyboards.">
+            <input id="fork-note" type="text" maxlength="2000" placeholder="Assume the supplier is out of keyboards.">
             <label for="fork-prompt">Ask the fork (optional)</label>
             <textarea id="fork-prompt" rows="2" placeholder="What changes in the plan?"></textarea>
             <div class="buttons"><button id="fork" disabled>Fork session</button></div>
@@ -178,7 +178,7 @@
         </div>
 
         <div class="rule-break"></div>
-        <details class="experiment-drawer"><summary><span class="section-kicker">03 / Try it</span><strong>Disconnect, abort, or restart</strong><span aria-hidden="true">＋</span></summary>
+        <details class="experiment-drawer"><summary><span class="section-kicker">05 / Try it</span><strong>Disconnect, abort, or restart</strong><span aria-hidden="true">＋</span></summary>
         <p class="panel-intro">These buttons work while a run is in progress.</p>
 
         <article class="experiment">
@@ -205,7 +205,7 @@
       <div class="note"><strong>Events are saved</strong>The agent keeps the last 300 events and sends them again when this page reconnects.</div>
       <div class="note"><strong>The deadline is an abort</strong>It is this app's own timer, which calls <code>PiHarness.abort()</code>. It is not a Cloudflare time limit.</div>
       <div class="note"><strong>Replay settings</strong>The Tools tab shows whether each tool may run again after a restart. Whether a given call does depends on where the restart cut it off.</div>
-      <div class="note"><strong>Tools that wait (Pi 1.6)</strong><code>ask_human</code>, <code>wait</code>, <code>delegate</code>, and the approval gate park their call on a signal or deadline. A parked call holds no invocation; one parked on a signal alone sets no alarm at all.</div>
+      <div class="note"><strong>Tools that wait (Pi 1.6)</strong><code>ask_human</code>, <code>wait</code>, <code>delegate</code>, and the approval gate park their call on a signal or deadline. A parked call runs nothing; one parked on a signal alone sets no alarm. Code Mode scripts can't wait, so with approvals on they can't call <code>exec</code> or <code>delete</code>.</div>
       <div class="note"><strong>Don't roll back</strong>Once a conversation runs on Pi 1.6, an Agents SDK on Pi 1.5 can't run its tool calls or model requests. Fix a bad deploy by deploying forward.</div>
       <div class="note"><strong>What a restart keeps</strong>Pi Durable saves the conversation and unfinished tasks in Durable Object storage. After a restart it asks the model again from that saved point; an answer that was mid-stream is retried.</div>
     </footer></details>

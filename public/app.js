@@ -296,7 +296,7 @@ function renderInspection(data) {
     const state = document.createElement("span"); state.className = "pill"; state.textContent = item.state || "unknown";
     row.append(title, endpoint, state);
     if (item.error) { const error = document.createElement("span"); error.className = "detail"; error.textContent = item.error; row.append(error); }
-    if (item.authUrl) {
+    if (item.authUrl && isWebLink(item.authUrl)) {
       const link = document.createElement("a"); link.href = item.authUrl; link.target = "_blank"; link.rel = "noopener noreferrer"; link.textContent = "Authorize again ↗";
       const wrap = document.createElement("span"); wrap.className = "detail"; wrap.append(link); row.append(wrap);
     }
@@ -330,7 +330,7 @@ function renderInspection(data) {
   for (const call of data.hands?.currentCalls || []) {
     const row = document.createElement("div"); row.className = "list-row";
     const title = document.createElement("strong"); title.textContent = `${call.nested ? "nested · " : ""}${call.name} · ${call.status}`; row.append(title);
-    if (call.parked) { const pill = document.createElement("span"); pill.className = "pill parked"; pill.textContent = "parked · holds no invocation"; row.append(pill); }
+    if (call.parked) { const pill = document.createElement("span"); pill.className = "pill parked"; pill.textContent = "parked · runs nothing while it waits"; row.append(pill); }
     if (call.output) { const output = document.createElement("pre"); output.textContent = call.output; row.append(output); }
     if (call.diagnostics?.length) { const diagnostics = document.createElement("pre"); diagnostics.textContent = JSON.stringify(call.diagnostics, null, 2); row.append(diagnostics); }
     calls.append(row);
@@ -389,15 +389,16 @@ function renderWaits(waits) {
     if (wait.kind === "question") {
       const answer = document.createElement("textarea"); answer.rows = 2; answer.placeholder = "Your answer"; answer.setAttribute("aria-label", `Answer to: ${wait.prompt.slice(0, 80)}`);
       const buttons = document.createElement("div"); buttons.className = "buttons";
-      const send = document.createElement("button"); send.className = "primary"; send.textContent = "Send answer";
+      const send = document.createElement("button"); send.className = "primary"; send.textContent = "Send answer"; send.setAttribute("aria-label", `Send answer to: ${wait.prompt.slice(0, 60)}`); answer.maxLength = 8000;
       send.addEventListener("click", () => answerWait(wait.key, { text: answer.value }, [send]));
       answer.addEventListener("keydown", (event) => { if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) send.click(); });
       buttons.append(send); row.append(answer, buttons);
     } else if (wait.kind === "approval") {
-      const note = document.createElement("input"); note.type = "text"; note.placeholder = "Note for the agent (optional)"; note.setAttribute("aria-label", "Note for the agent");
+      const what = `${wait.tool} ${wait.prompt.replace(/\s+/g, " ").slice(0, 40)}`;
+      const note = document.createElement("input"); note.type = "text"; note.maxLength = 2000; note.placeholder = "Note for the agent (optional)"; note.setAttribute("aria-label", `Note for the agent about ${what}`);
       const buttons = document.createElement("div"); buttons.className = "buttons";
-      const allow = document.createElement("button"); allow.className = "primary"; allow.textContent = "Allow";
-      const deny = document.createElement("button"); deny.className = "danger"; deny.textContent = "Deny";
+      const allow = document.createElement("button"); allow.className = "primary"; allow.textContent = "Allow"; allow.setAttribute("aria-label", `Allow ${what}`);
+      const deny = document.createElement("button"); deny.className = "danger"; deny.textContent = "Deny"; deny.setAttribute("aria-label", `Deny ${what}`);
       allow.addEventListener("click", () => answerWait(wait.key, { decision: "allow", text: note.value }, [allow, deny]));
       deny.addEventListener("click", () => answerWait(wait.key, { decision: "deny", text: note.value }, [allow, deny]));
       buttons.append(allow, deny); row.append(note, buttons);
@@ -426,13 +427,23 @@ function renderWaits(waits) {
 }
 
 function updateCountdowns() {
-  for (const { countdown, wait } of waitRows.values()) countdown.textContent = wait.until ? timeLeft(wait.until) : "no deadline · holds no alarm";
+  for (const { countdown, wait } of waitRows.values()) countdown.textContent = wait.until ? timeLeft(wait.until) : "no deadline · sets no alarm";
 }
 
-function resetWaits() {
+function resetWaits({ all = false } = {}) {
   waitRows.clear();
   $("waits").innerHTML = '<div class="empty">Nothing is waiting.</div>';
   $("waiting-badge").hidden = true;
+  $("waiting-count").textContent = "0";
+  if (all) {
+    $("wait-history").innerHTML = '<div class="empty">No parked calls yet.</div>';
+    $("wait-history-count").textContent = "0";
+    mcpAlerted.clear();
+  }
+}
+
+function isWebLink(value) {
+  try { return ["http:", "https:"].includes(new URL(value).protocol); } catch { return false; }
 }
 
 async function answerWait(key, body, buttons) {
@@ -442,6 +453,10 @@ async function answerWait(key, body, buttons) {
   try {
     const result = await requestJson(`/agents/${agentId}/answer`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ key, ...body }) });
     if (result.result !== "delivered") addEvent({ id: crypto.randomUUID(), at: new Date().toISOString(), type: `demo.signal.${result.result}`, level: "warn", details: { key } });
+    // The call no longer waits on this person; don't leave the row until the next inspection.
+    const entry = waitRows.get(key);
+    if (entry) { entry.row.remove(); waitRows.delete(key); }
+    if (!waitRows.size) resetWaits();
     if (pollController) await refreshInspection(pollController.signal, connectionGeneration);
   } catch (error) {
     showError("demo.answer.failed", error.message);
@@ -487,6 +502,8 @@ async function forkSession() {
 async function reconnectMcp(serverId, button) {
   button.disabled = true; button.textContent = "Reconnecting…";
   const result = await postAction("mcp-reconnect", { serverId }, "demo.mcp.reconnect_failed");
+  // The next inspection rebuilds the row; restore the button in case none comes (socket closed, or busy).
+  button.disabled = false; button.textContent = "Reconnect";
   if (result) addEvent({ id: crypto.randomUUID(), at: new Date().toISOString(), type: "demo.mcp.reconnected", details: { serverId, state: result.state } });
 }
 
@@ -565,14 +582,17 @@ async function launch() {
   try {
     const history = parseHistory($("history").value);
     const replyMinutes = Number($("reply-minutes").value);
+    if (!Number.isInteger(replyMinutes) || replyMinutes < 1 || replyMinutes > 1440) throw new Error("Reply deadline must be a whole number of minutes from 1 to 1440.");
+    if (history.length > 200) throw new Error("A starting history can have at most 200 messages.");
+    if (history.length && history[0].role !== "user") throw new Error("A starting history must begin with a User: message.");
     const body = {
       prompt: $("prompt").value.trim(),
       approvals: $("approvals").checked,
-      ...(Number.isInteger(replyMinutes) && replyMinutes >= 1 && replyMinutes <= 1440 ? { replyMinutes } : {}),
+      replyMinutes,
       ...(history.length ? { history } : {}),
     };
     const result = await requestJson("/agents", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
-    agentId = result.agentId; currentStatus = "running"; localStorage.setItem(agentStorageKey, agentId); eventRows.clear(); eventsEl.replaceChildren(); filterEvents(); resetWaits();
+    agentId = result.agentId; currentStatus = "running"; localStorage.setItem(agentStorageKey, agentId); eventRows.clear(); eventsEl.replaceChildren(); filterEvents(); resetWaits({ all: true });
     $("answer").textContent = "Waiting for a run to finish.";
     const code = document.createElement("code"); code.textContent = agentId; $("agent-id").replaceChildren(code);
     setStatus({ status: "running", operationId: result.operationId }); connect();
@@ -584,7 +604,7 @@ async function resumeRun() {
   if (!agentId || requestBusy) return;
   requestBusy = true; $("resume-run").textContent = "Resuming…"; updateControls();
   try {
-    await requestJson(`/agents/${agentId}/resume`, { method: "POST" });
+    await requestJson(`/agents/${agentId}/resume`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
     connect();
   } catch (error) {
     showError("demo.resume.failed", error.message);
@@ -594,13 +614,15 @@ async function resumeRun() {
 }
 
 async function interrupt(cause) {
-  if (!agentId || !activeRun()) return;
+  if (!agentId || !activeRun() || requestBusy) return;
+  requestBusy = true; updateControls();
   try {
     const result = await requestJson(`/agents/${agentId}/interrupt`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ cause }) });
     if (!result.interrupted) addEvent({ id: crypto.randomUUID(), at: new Date().toISOString(), type: "demo.interrupt.no_active_run", level: "warn", details: { cause } });
     if (cause === "runtime-crash" && result.interrupted) connect();
     if (pollController) await refreshStatus(pollController.signal, connectionGeneration);
   } catch (error) { showError("demo.interrupt.failed", error.message); }
+  finally { requestBusy = false; updateControls(); }
 }
 async function armDeadline() {
   if (!agentId || !activeRun()) return;

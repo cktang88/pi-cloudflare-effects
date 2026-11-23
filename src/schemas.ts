@@ -32,6 +32,11 @@ export const ForkInput = Schema.Struct({
 	note: Schema.optionalKey(Schema.String),
 });
 
+/** HumanAnswer's signal schema allows 8,000 characters; ApprovalDecision's note 2,000. index.ts checks the lengths. */
+export const ANSWER_MAX = 8_000;
+export const NOTE_MAX = 2_000;
+export const HISTORY_MAX = 200;
+
 export const AnswerInput = Schema.Struct({
 	key: Schema.NonEmptyString,
 	text: Schema.optionalKey(Schema.String),

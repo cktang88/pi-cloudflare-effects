@@ -55,6 +55,16 @@ export interface LaunchOptions {
 	replyMinutes?: number;
 }
 
+/** An expected failure returned (not thrown) so its HTTP status survives the Durable Object RPC boundary. */
+export interface RequestFailure {
+	error: string;
+	status: 400 | 404 | 409;
+}
+
+export function isRequestFailure(value: unknown): value is RequestFailure {
+	return typeof value === "object" && value !== null && "error" in value && "status" in value && typeof (value as RequestFailure).status === "number";
+}
+
 export interface MessageOptions {
 	mode: "queue" | "steer";
 	keep: boolean;

@@ -30,7 +30,7 @@ import {
 	type ToolRegistration,
 } from "@earendil-works/pi-durable";
 import type { AssistantMessage, Usage } from "@earendil-works/pi-ai";
-import { num, obj, str } from "@earendil-works/pi-schema";
+import { lit, num, obj, str, union } from "@earendil-works/pi-schema";
 import { Agent, type AgentContext, type Connection, type ConnectionContext } from "agents";
 import { Browser, browserRun } from "agents/browser";
 import { browserTool } from "agents/browser/pi";
@@ -43,7 +43,7 @@ import { webSearchTool } from "agents/websearch/pi";
 import { tracing } from "cloudflare:workers";
 import { errorMessage, traced } from "./observability";
 import { decodeMcpServers } from "./schemas";
-import type { AgentEvent, AgentInspection, AgentSettings, AgentStatus, ConversationSnapshot, DemoInterrupt, Env, HistoryItem, LaunchOptions, MessageOptions, ToolCallView, TranscriptItem, WaitDecision, WaitView } from "./types";
+import type { AgentEvent, AgentInspection, AgentSettings, AgentStatus, ConversationSnapshot, DemoInterrupt, Env, HistoryItem, LaunchOptions, MessageOptions, RequestFailure, ToolCallView, TranscriptItem, WaitDecision, WaitView } from "./types";
 
 const DEFAULT_MODEL = "@cf/zai-org/glm-5.3-flash";
 const CORE_EXTENSION = "cloudflare-agent-tools";
@@ -60,7 +60,7 @@ Tools:
 - ask_human: ask the person a question and wait for the reply. You do not stay running while you wait.
 - wait: pause for a number of seconds (for example, before checking something again). You do not stay running while you wait.
 - delegate: hand a self-contained task to a subagent and get its answer.
-- Some tools (exec, delete, container_exec) may need the person's approval first. If a call is refused, say so and continue without it.
+- Some tools (exec, delete, container_exec) may need the person's approval first. When they do, call them directly, not from code_mode, because a script can't wait for an approval. If a call is refused, say so and continue without it.
 
 Save facts that will help later runs in /memory.md. Check each step before the next, and say what you did and what failed.`;
 /** Computer tools that are safe to run again if a restart interrupts them (same list as the Agents Pi harness example). */
@@ -78,7 +78,7 @@ const ZERO_USAGE: Usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, to
  * alarm, if it has no deadline) until `PiHarness.signal()` delivers a value.
  */
 const HumanAnswer = defineSignal({ name: "app.human-answer", version: 1, schema: obj({ text: str({ maxLength: 8_000 }) }) });
-const ApprovalDecision = defineSignal({ name: "app.approval", version: 1, schema: obj({ decision: str({ minLength: 4, maxLength: 5 }), note: str({ maxLength: 2_000 }) }) });
+const ApprovalDecision = defineSignal({ name: "app.approval", version: 1, schema: obj({ decision: union([lit("allow"), lit("deny")]), note: str({ maxLength: 2_000 }) }) });
 /** `WebSocket.OPEN`; the constant is not defined on every runtime's global. */
 const SOCKET_OPEN = 1;
 
@@ -88,7 +88,7 @@ const GenerateImage = obj({
 	prompt: str({ minLength: 1, maxLength: 4_000 }),
 });
 const AskHuman = obj({ question: str({ minLength: 1, maxLength: 4_000, description: "The question for the person, with any context they need to answer." }) });
-const Wait = obj({ seconds: num({ description: "How long to wait, from 1 to 86400 seconds." }) });
+const Wait = obj({ seconds: num({ minimum: 1, maximum: 86_400, description: "How long to wait, in seconds (1 to 86400)." }) });
 const ContainerExec = obj({ command: str({ minLength: 1, maxLength: 16_384 }) });
 const CodeMode = obj({ code: str({ minLength: 1, description: "An async arrow function. Connector methods are globals (workspace.*, web.*, and one per MCP server); codemode.search() and codemode.describe() find them." }) });
 
@@ -101,7 +101,12 @@ const WORKSPACE_READS = new Set(["read", "ls", "find", "grep"]);
  * a failed call throws in the script with the tool's message.
  */
 class WorkspaceConnector extends CodemodeConnector {
-	constructor(ctx: DurableObjectState, private readonly computer: CreatePiToolsResult) {
+	constructor(
+		ctx: DurableObjectState,
+		private readonly computer: CreatePiToolsResult,
+		/** Whether exec and delete need a person's approval. The beforeTool gate can't see calls made from a script. */
+		private readonly approvalsOn: () => Promise<boolean>,
+	) {
 		super(ctx as unknown as ExecutionContext, {});
 	}
 
@@ -119,6 +124,9 @@ class WorkspaceConnector extends CodemodeConnector {
 			inputSchema: tool.parameters as ConnectorTools[string]["inputSchema"],
 			...(WORKSPACE_READS.has(tool.name) ? { replay: "reexecute" as const } : {}),
 			execute: async (args: unknown) => {
+				if (APPROVAL_TOOLS.has(tool.name) && await this.approvalsOn()) {
+					throw new Error(`workspace.${tool.name} needs a person's approval while approvals are on, and a script can't wait for one. Call the ${tool.name} tool directly instead.`);
+				}
 				const result = await this.computer.execute({ id: crypto.randomUUID(), name: tool.name, arguments: args });
 				const text = result.content.map((part) => part.type === "text" ? part.text : `[${part.mimeType} image]`).join("\n");
 				if (result.isError) throw new Error(text);
@@ -257,8 +265,8 @@ export class PiAgent extends Agent<Env> {
 					mechanism: "PiHarness reopened Pi, which resumed its saved tasks",
 				}, "info", status.operationId);
 			}
-			// Not awaited: startup must not wait for the run to finish.
-			void this.settleWhenDone(status.operationId);
+			// Not awaited: startup must not wait for the runs to finish.
+			for (const operationId of await this.trackedOperations()) void this.settleWhenDone(operationId);
 		}
 		// Sockets stay open while the object hibernates; give each one a new watch.
 		for (const connection of this.getConnections()) await this.watchView(connection);
@@ -362,6 +370,7 @@ export class PiAgent extends Agent<Env> {
 		const operationId = crypto.randomUUID();
 		try {
 			return await traced("agent.run", { "agent.id": this.name, "agent.operation_id": operationId }, async () => {
+				await this.ctx.storage.put("agent:operations", [operationId]);
 				await this.saveStatus({ status: "running", operationId });
 				const result = await this.piHarness.prompt(prompt, { operationId });
 				if (result.status !== "done") throw new Error(unansweredMessage(result.reason));
@@ -394,6 +403,7 @@ export class PiAgent extends Agent<Env> {
 				}, created ? "info" : "warn");
 			}
 			await this.recordEvent("agent.settings", { approvals: settings.approvals, replyMinutes: settings.replyMinutes });
+			await this.ctx.storage.put("agent:operations", [operationId]);
 			await this.saveStatus({ status: "running", operationId });
 			try {
 				await this.piHarness.submit(prompt, { operationId });
@@ -420,20 +430,47 @@ export class PiAgent extends Agent<Env> {
 				...(options.keep ? { onAbort: "keep" as const } : {}),
 			});
 			await this.recordEvent("agent.message.submitted", { mode: options.mode, keep: options.keep, chars: prompt.length }, "info", operationId);
-			await this.saveStatus({ status: "running", operationId });
-			void this.settleWhenDone(operationId);
+			await this.trackOperation(operationId);
 			return { operationId };
 		});
 	}
 
 	/** Asks the model to answer the existing transcript again, without a new message (after a failed or turn-limited run). */
-	async continueRun(): Promise<{ operationId: string }> {
+	async continueRun(): Promise<{ operationId: string } | RequestFailure> {
+		if ((await this.getStatus()).status === "running") return { error: "The agent is still working; continue it after the run ends", status: 409 };
 		const operationId = crypto.randomUUID();
 		await this.piHarness.continue({ operationId });
 		await this.recordEvent("agent.run.continued", {}, "info", operationId);
-		await this.saveStatus({ status: "running", operationId });
-		void this.settleWhenDone(operationId);
+		await this.trackOperation(operationId);
 		return { operationId };
+	}
+
+	/**
+	 * Every operation this page started and Pi hasn't settled. The status follows the oldest
+	 * one, so a follow-up message never hides the run that is working; the status is final
+	 * only when none is left.
+	 */
+	private async trackedOperations(): Promise<string[]> {
+		const operations = await this.ctx.storage.get<string[]>("agent:operations");
+		if (operations) return operations;
+		// Agents launched before operations were tracked: the status names the one operation.
+		const status = await this.ctx.storage.get<AgentStatus>("agent:status");
+		return status?.status === "running" && status.operationId ? [status.operationId] : [];
+	}
+
+	private async trackOperation(operationId: string): Promise<void> {
+		const operations = await this.trackedOperations();
+		await this.ctx.storage.put("agent:operations", [...operations, operationId]);
+		const status = await this.ctx.storage.get<AgentStatus>("agent:status");
+		if (status?.status !== "running" || !status.operationId) await this.saveStatus({ status: "running", operationId });
+		void this.settleWhenDone(operationId);
+	}
+
+	/** The operation Pi is working on now (not a queued one), for "Abort now". */
+	private async activeOperation(fallback: string): Promise<string> {
+		const pending = await this.piHarness.pending();
+		const tracked = new Set(await this.trackedOperations());
+		return pending.find((operation) => operation.status === "running" && tracked.has(operation.operationId))?.operationId ?? fallback;
 	}
 
 	/**
@@ -465,30 +502,35 @@ export class PiAgent extends Agent<Env> {
 	}
 
 	/** Delivers a person's answer or approval decision to a parked call with `PiHarness.signal()`. */
-	async answerWait(key: string, decision: WaitDecision): Promise<{ result: string }> {
+	async answerWait(key: string, decision: WaitDecision): Promise<{ result: string } | RequestFailure> {
 		const [row] = this.sql<WaitRow>`SELECT * FROM agent_waits WHERE key = ${key}`;
-		if (!row) throw new Error("No waiting call with that key");
+		if (!row) return { error: "No waiting call with that key", status: 404 };
 		if (row.status !== "waiting") return { result: `already ${row.status}` };
 		// harness.signal() arms the wake job before delivering; pi.signal() would not.
 		const taskId = row.task_id as Parameters<PiHarness["signal"]>[0];
 		let result: string;
 		if (row.kind === "question") {
-			if (!decision.text?.trim()) throw new Error("An answer needs text");
+			if (!decision.text?.trim()) return { error: "An answer needs text", status: 400 };
 			result = await this.piHarness.signal(taskId, HumanAnswer, row.signal_key ?? "answer", { text: decision.text.trim() });
 		} else if (row.kind === "approval") {
-			if (decision.decision !== "allow" && decision.decision !== "deny") throw new Error("decision must be allow or deny");
+			if (decision.decision !== "allow" && decision.decision !== "deny") return { error: "decision must be allow or deny", status: 400 };
 			result = await this.piHarness.signal(taskId, ApprovalDecision, row.signal_key ?? key, { decision: decision.decision, note: decision.text?.trim() ?? "" });
 		} else {
-			throw new Error(`A ${row.kind} wait can't be answered from here`);
+			return { error: `A ${row.kind} wait can't be answered from here`, status: 400 };
 		}
 		await this.recordEvent("agent.signal.delivered", { kind: row.kind, tool: row.tool, result, ...(decision.decision ? { decision: decision.decision } : {}) }, result === "delivered" ? "info" : "warn");
 		// `closed` and `not_found` mean the call is gone (aborted or finished); `duplicate` means it already has a value.
-		if (result === "closed" || result === "not_found") await this.closeWait(key, "cancelled", result);
+		if (result === "closed" || result === "not_found") {
+			// After the deadline the key is closed even before the call wakes; that is an expiry, not a cancel.
+			const expired = row.until !== null && Date.now() >= row.until;
+			await this.closeWait(key, expired ? "expired" : "cancelled", expired ? undefined : result);
+		}
 		return { result };
 	}
 
 	/** Agents 0.34: a failed MCP server stays failed until it is reconnected. */
-	async reconnectMcp(serverId: string): Promise<{ state: string }> {
+	async reconnectMcp(serverId: string): Promise<{ state: string } | RequestFailure> {
+		if (!this.mcp.listServers().some((server) => server.id === serverId)) return { error: "No MCP server with that id", status: 404 };
 		await this.reconnectMcpServer(serverId);
 		const state = this.mcp.mcpConnections[serverId]?.connectionState ?? "not connected";
 		await this.recordEvent("agent.mcp.reconnect_requested", { serverId, state: String(state) });
@@ -532,7 +574,11 @@ export class PiAgent extends Agent<Env> {
 					const state = await api.readSignal(SubmissionSettled, "answered", context);
 					if (state !== undefined && "value" in state) {
 						const settled = state.value;
-						await this.closeWait(waitKey(api.taskId, "answered"), settled.status === "done" ? "answered" : "expired", settled.status);
+						await this.closeWait(
+							waitKey(api.taskId, "answered"),
+							settled.status === "done" ? "answered" : "cancelled",
+							settled.status === "unanswered" ? `unanswered: ${settled.reason}` : settled.status,
+						);
 						if (settled.status !== "done" || settled.type === "write") {
 							return { output: [{ type: "text", text: `Subagent ended unanswered: ${settled.status === "unanswered" ? settled.reason : settled.status}` }], isError: true };
 						}
@@ -641,14 +687,14 @@ export class PiAgent extends Agent<Env> {
 			hooks: [hook(ToolTask, {
 				beforeTool: async (call, api, context) => {
 					if (!APPROVAL_TOOLS.has(call.name)) return undefined;
-					if (!(await this.settings()).approvals) return undefined;
+					const { approvals, replyMinutes } = await this.settings();
+					if (!approvals) return undefined;
 					const signalKey = `approve-${call.id}`;
 					const key = waitKey(api.taskId, signalKey);
 					const state = await api.readSignal(ApprovalDecision, signalKey, context);
-					const { replyMinutes } = await this.settings();
 					const until = await api.memo(`approvals.until.${signalKey}`, api.now() + replyMinutes * 60_000, context);
 					if (state === undefined && api.now() < until) {
-						await this.openWait({ key, taskId: String(api.taskId), kind: "approval", tool: call.name, prompt: JSON.stringify(call.arguments ?? {}).slice(0, 4_000), signalKey, until });
+						await this.openWait({ key, taskId: String(api.taskId), kind: "approval", tool: call.name, prompt: JSON.stringify(call.arguments ?? {}, null, 2), signalKey, until });
 						return { sleep: { signals: [ApprovalDecision.key(signalKey)], until } };
 					}
 					if (state === undefined || !("value" in state)) {
@@ -657,6 +703,13 @@ export class PiAgent extends Agent<Env> {
 					}
 					await this.closeWait(key, "answered", state.value.decision);
 					return state.value.decision === "allow" ? undefined : { block: state.value.note ? `Denied: ${state.value.note}` : "Denied by the person" };
+				},
+				// A call held at the gate is not parked inside the tool, so its cancel() never runs on an abort.
+				// afterTool runs on every result (aborted and abandoned included), so it closes a row left waiting.
+				// closeWait does nothing to a row that is already closed.
+				afterTool: async (call, _result, api) => {
+					if (APPROVAL_TOOLS.has(call.name)) await this.closeWait(waitKey(api.taskId, `approve-${call.id}`), "cancelled");
+					return undefined;
 				},
 			})],
 		});
@@ -723,7 +776,7 @@ export class PiAgent extends Agent<Env> {
 			ctx: this.ctx,
 			executor: new DynamicWorkerExecutor({ loader: this.env.LOADER }),
 			connectors: [
-				new WorkspaceConnector(this.ctx, this.computerTools()),
+				new WorkspaceConnector(this.ctx, this.computerTools(), async () => (await this.settings()).approvals),
 				new WebConnector(this.ctx, this.env.AI, this.env.AI_GATEWAY_ID ?? "default"),
 				...mcp,
 			],
@@ -868,15 +921,18 @@ export class PiAgent extends Agent<Env> {
 			agentId: this.name, status: "idle", updatedAt: new Date(0).toISOString(),
 		};
 		if (status.status !== "running" || !status.operationId) return status;
-		const pending = await this.piHarness.pending();
-		if (pending.some((operation) => operation.operationId === status.operationId)) return status;
-		// Not pending means finished. The timeout covers a run Pi never accepted.
-		const result = await this.piHarness.wait(status.operationId, { signal: AbortSignal.timeout(5_000) }).catch(() => undefined);
-		await this.finishRun(status.operationId, !result
-			? { status: "failed", lastError: "Pi Durable has no record of this run" }
-			: result.status === "done"
-				? { status: "complete", lastResponse: result.text ?? "" }
-				: { status: "failed", lastError: unansweredMessage(result.reason) });
+		const pending = new Set((await this.piHarness.pending()).map((operation) => operation.operationId));
+		const finished = (await this.trackedOperations()).filter((operationId) => !pending.has(operationId));
+		if (!finished.length) return status;
+		for (const operationId of finished) {
+			// Not pending means finished. The timeout covers a run Pi never accepted.
+			const result = await this.piHarness.wait(operationId, { signal: AbortSignal.timeout(5_000) }).catch(() => undefined);
+			await this.finishRun(operationId, !result
+				? { status: "failed", lastError: "Pi Durable has no record of this run" }
+				: result.status === "done"
+					? { status: "complete", lastResponse: result.text ?? "" }
+					: { status: "failed", lastError: unansweredMessage(result.reason) });
+		}
 		return (await this.ctx.storage.get<AgentStatus>("agent:status")) ?? status;
 	}
 
@@ -993,7 +1049,7 @@ export class PiAgent extends Agent<Env> {
 					const { id, name, server_url } = server;
 					const connection = this.mcp.mcpConnections[id];
 					// Agents 0.34: a server that needs the user to authorize again carries a link.
-					const authUrl = (server as { auth_url?: string | null }).auth_url;
+					const authUrl = safeLink((server as { auth_url?: string | null }).auth_url);
 					return {
 						id,
 						name,
@@ -1035,8 +1091,9 @@ export class PiAgent extends Agent<Env> {
 			this.ctx.abort("Demo: simulate abrupt Durable Object restart", { retryAlarm: true });
 			return { interrupted: true, operationId: status.operationId };
 		}
-		const interrupted = await this.piHarness.abort({ operationId: status.operationId });
-		return { interrupted, operationId: status.operationId };
+		const operationId = await this.activeOperation(status.operationId);
+		const interrupted = await this.piHarness.abort({ operationId });
+		return { interrupted, operationId };
 	}
 
 	async armDemoDeadline(seconds: number): Promise<{ scheduled: boolean; operationId?: string; deadlineAt?: string }> {
@@ -1065,9 +1122,27 @@ export class PiAgent extends Agent<Env> {
 
 	/** Records how a run ended, only if the status still shows that run as running, so it is recorded once. */
 	private async finishRun(operationId: string, update: { status: "complete"; lastResponse: string } | { status: "failed"; lastError: string }): Promise<void> {
+		const operations = await this.trackedOperations();
 		const status = await this.ctx.storage.get<AgentStatus>("agent:status");
-		if (status?.status !== "running" || status.operationId !== operationId) return;
-		await this.saveStatus(update);
+		// Recorded once: a second settle finds the operation gone (and run() has no tracked list).
+		if (!operations.includes(operationId) && (status?.status !== "running" || status.operationId !== operationId)) return;
+		const remaining = operations.filter((id) => id !== operationId);
+		await this.ctx.storage.put("agent:operations", remaining);
+		if (operations.length > 1 || status?.operationId !== operationId) {
+			await this.recordEvent(update.status === "complete" ? "agent.operation.answered" : "agent.operation.unanswered", update.status === "complete"
+				? { chars: update.lastResponse.length }
+				: { reason: update.lastError }, update.status === "complete" ? "info" : "warn", operationId);
+		}
+		if (status?.status !== "running") return;
+		const [next] = remaining;
+		if (next) {
+			// Keep running on the next live operation (a queued or kept message), with this one's outcome attached.
+			if (status.operationId === operationId) {
+				await this.saveStatus({ status: "running", operationId: next, ...(update.status === "complete" ? { lastResponse: update.lastResponse } : { lastError: update.lastError }) });
+			}
+			return;
+		}
+		await this.saveStatus({ ...update, operationId });
 	}
 
 	private async saveStatus(update: Partial<AgentStatus> & Pick<AgentStatus, "status">): Promise<void> {
@@ -1079,7 +1154,7 @@ export class PiAgent extends Agent<Env> {
 			...(update.lastResponse !== undefined ? { lastResponse: update.lastResponse } : {}),
 			...((update.operationId ?? previous?.operationId) ? { operationId: update.operationId ?? previous?.operationId } : {}),
 		};
-		if (update.status === "running") status.lastResponse = previous?.lastResponse;
+		if (update.status === "running" && update.lastResponse === undefined) status.lastResponse = previous?.lastResponse;
 		await this.ctx.storage.put("agent:status", status);
 		if ((status.status === "complete" || status.status === "failed") && status.operationId) {
 			const deadlineId = await this.ctx.storage.get<string>(`demo:deadline:${status.operationId}`);
@@ -1289,4 +1364,15 @@ type ForkedSession = {
 function sessionHandle(value: unknown): ForkedSession {
 	const candidate = value as { session?: ForkedSession } & ForkedSession;
 	return candidate.session ?? candidate;
+}
+
+/** A link the page may show: http(s) only, so a server row can't smuggle in a javascript: URL. */
+function safeLink(value: string | null | undefined): string | undefined {
+	if (!value) return undefined;
+	try {
+		const url = new URL(value);
+		return url.protocol === "https:" || url.protocol === "http:" ? url.toString() : undefined;
+	} catch {
+		return undefined;
+	}
 }

@@ -2,8 +2,8 @@ import { routeAgentRequest } from "agents";
 import { Schema } from "effect";
 import { errorMessage } from "./observability";
 import { Orchestrator } from "./orchestrator";
-import { AnswerInput, DeadlineInput, ForkInput, InterruptInput, LaunchInput, McpReconnectInput, MessageInput, RunInput } from "./schemas";
-import type { Env } from "./types";
+import { ANSWER_MAX, AnswerInput, DeadlineInput, ForkInput, HISTORY_MAX, InterruptInput, LaunchInput, McpReconnectInput, MessageInput, NOTE_MAX, RunInput } from "./schemas";
+import { isRequestFailure, type Env } from "./types";
 import { PiAgent } from "./worker-agent";
 
 export { Orchestrator, PiAgent };
@@ -22,12 +22,24 @@ export default {
 		}
 		const orchestrator = env.ORCHESTRATOR.get(env.ORCHESTRATOR.idFromName("main"));
 
+		// Cross-site POSTs are refused. A JSON content type also forces a CORS preflight, which this
+		// Worker never answers, so a page on another site can't launch or steer an agent through a
+		// visitor's browser (for example against a local `wrangler dev`).
+		if (request.method === "POST") {
+			if (request.headers.get("Sec-Fetch-Site") === "cross-site") return json({ error: "Cross-site requests are not allowed" }, 403);
+			if (!request.headers.get("content-type")?.toLowerCase().startsWith("application/json")) {
+				return json({ error: "Send the body as application/json" }, 415);
+			}
+		}
+
 		if (url.pathname === "/agents" && request.method === "POST") {
 			const input = await readBody(request, decodeLaunchInput);
 			if (input instanceof Response) return input;
+			if ((input.history?.length ?? 0) > HISTORY_MAX) return json({ error: `history can have at most ${HISTORY_MAX} messages` }, 400);
+			if (input.history?.length && input.history[0]?.role !== "user") return json({ error: "history must start with a user message" }, 400);
 			try {
 				return json(await orchestrator.launch(input.prompt, {
-					...(input.history?.length ? { history: input.history.slice(0, 200) } : {}),
+					...(input.history?.length ? { history: input.history } : {}),
 					...(input.approvals !== undefined ? { approvals: input.approvals } : {}),
 					...(input.replyMinutes !== undefined ? { replyMinutes: input.replyMinutes } : {}),
 				}), 202);
@@ -86,23 +98,26 @@ export default {
 			if (request.method === "POST" && action === "message") {
 				const input = await readBody(request, decodeMessageInput);
 				if (input instanceof Response) return input;
-				return json(await orchestrator.sendMessage(agentId, input.prompt, { mode: input.mode, keep: input.keep }), 202);
+				return reply(await orchestrator.sendMessage(agentId, input.prompt, { mode: input.mode, keep: input.keep }), 202);
 			}
 
 			if (request.method === "POST" && action === "continue") {
-				return json(await orchestrator.continueRun(agentId), 202);
+				return reply(await orchestrator.continueRun(agentId), 202);
 			}
 
 			if (request.method === "POST" && action === "fork") {
 				const input = await readBody(request, decodeForkInput);
 				if (input instanceof Response) return input;
-				return json(await orchestrator.forkSession(agentId, input.prompt?.trim() || undefined, input.note?.trim() || undefined), 202);
+				if ((input.note?.length ?? 0) > NOTE_MAX) return json({ error: `note can have at most ${NOTE_MAX} characters` }, 400);
+				return reply(await orchestrator.forkSession(agentId, input.prompt?.trim() || undefined, input.note?.trim() || undefined), 202);
 			}
 
 			if (request.method === "POST" && action === "answer") {
 				const input = await readBody(request, decodeAnswerInput);
 				if (input instanceof Response) return input;
-				return json(await orchestrator.answerWait(agentId, input.key, {
+				const limit = input.decision ? NOTE_MAX : ANSWER_MAX;
+				if ((input.text?.trim().length ?? 0) > limit) return json({ error: `text can have at most ${limit} characters` }, 400);
+				return reply(await orchestrator.answerWait(agentId, input.key, {
 					...(input.text !== undefined ? { text: input.text } : {}),
 					...(input.decision ? { decision: input.decision } : {}),
 				}));
@@ -111,7 +126,7 @@ export default {
 			if (request.method === "POST" && action === "mcp-reconnect") {
 				const input = await readBody(request, decodeMcpReconnectInput);
 				if (input instanceof Response) return input;
-				return json(await orchestrator.reconnectMcp(agentId, input.serverId));
+				return reply(await orchestrator.reconnectMcp(agentId, input.serverId));
 			}
 
 			if (request.method === "POST" && action === "deadline") {
@@ -153,6 +168,13 @@ async function readBody<A>(request: Request, decode: (input: unknown) => A): Pro
 
 function isLocalDemoRequest(hostname: string): boolean {
 	return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]";
+}
+
+/** null is an unknown agent; a RequestFailure carries its own status. */
+function reply(value: unknown, status = 200): Response {
+	if (value === null) return json({ error: "Agent not found" }, 404);
+	if (isRequestFailure(value)) return json({ error: value.error }, value.status);
+	return json(value, status);
 }
 
 function json(value: unknown, status = 200): Response {

@@ -169,7 +169,9 @@ curl -X POST http://localhost:8787/agents \
   -d '{"prompt":"Inspect the project and summarize its structure."}'
 ```
 
-The `202` response has an `agentId`, an `operationId`, and `seeded` (whether a `history` was written). The run continues after the response is sent.
+The `202` response has an `agentId`, an `operationId`, and `seeded` (whether a `history` was written). Every `POST` must be sent as `application/json` (otherwise `415`), and cross-site requests are refused (`403`), so another website can't drive a local `wrangler dev` through your browser. Expected failures use `400` (bad input), `404` (unknown agent, waiting call, or MCP server), and `409` (continuing a run that is still working).
+
+Follow-up messages don't replace the run being tracked: the status follows the oldest unfinished operation and is final only when none is left. **Abort now** aborts the operation Pi is working on, not a queued one. The run continues after the response is sent.
 
 | Request | Result |
 | --- | --- |

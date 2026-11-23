@@ -78,30 +78,30 @@ export class Orchestrator extends DurableAgent<Env> {
 		return agent.armDemoDeadline(seconds);
 	}
 
+	// Like the methods above, these return null for an unknown agent, which the router answers with 404.
 	async sendMessage(agentId: string, prompt: string, options: MessageOptions) {
-		return (await this.requireAgent(agentId)).sendMessage(prompt, options);
+		const agent = await this.findAgent(agentId);
+		return agent ? agent.sendMessage(prompt, options) : null;
 	}
 
 	async continueRun(agentId: string) {
-		return (await this.requireAgent(agentId)).continueRun();
+		const agent = await this.findAgent(agentId);
+		return agent ? agent.continueRun() : null;
 	}
 
 	async forkSession(agentId: string, prompt?: string, note?: string) {
-		return (await this.requireAgent(agentId)).forkSession(prompt, note);
+		const agent = await this.findAgent(agentId);
+		return agent ? agent.forkSession(prompt, note) : null;
 	}
 
 	async answerWait(agentId: string, key: string, decision: WaitDecision) {
-		return (await this.requireAgent(agentId)).answerWait(key, decision);
+		const agent = await this.findAgent(agentId);
+		return agent ? agent.answerWait(key, decision) : null;
 	}
 
 	async reconnectMcp(agentId: string, serverId: string) {
-		return (await this.requireAgent(agentId)).reconnectMcp(serverId);
-	}
-
-	private async requireAgent(agentId: string) {
 		const agent = await this.findAgent(agentId);
-		if (!agent) throw new Error(`Agent ${agentId} not found`);
-		return agent;
+		return agent ? agent.reconnectMcp(serverId) : null;
 	}
 
 	async listAgents(): Promise<Array<{ name: string; createdAt: number }>> {
